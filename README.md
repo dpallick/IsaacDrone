@@ -92,11 +92,15 @@ python main.py
 IsaacDrone/
 ├── controllers/
 │   ├── __init__.py
-│   └── pid_controller.py
+│   ├── pid_controller.py
+│   └── rl_hover_controller.py   
 ├── environments/
 │   ├── __init__.py
 │   └── drone_hover_env.py
+├── checkpoints/                    
+│   └── rl_hover.pt           
 ├── main.py
+├── train_rl_hover.py        
 └── README.md
 ```
 
@@ -122,3 +126,18 @@ Launches Isaac Lab, loads the environment, initializes the controller, and runs 
 
 ---
 
+# Useful Commands for running the RL
+```bash
+python train_rl_hover.py \
+  --num_envs 64 \
+  --iters 1000 \
+  --steps 64 \
+  --save_path checkpoints/rl_hover.pt \
+  --headless
+```
+Trains using the train_rl_hover.py to hover. Doesn't take sensor input yet but calculates reward based on the position and velocity of the drone as per isaac enviroment values. A reward above -0.3 will most likely work for hovering. 
+
+```bash
+python main.py --RLHover --rl_checkpoint checkpoints/rl_hover.pt
+```
+Runs the hover controller using the trained checkpoints. 
