@@ -141,3 +141,14 @@ Trains using the train_rl_hover.py to hover. Doesn't take sensor input yet but c
 python main.py --RLHover --rl_checkpoint checkpoints/rl_hover.pt
 ```
 Runs the hover controller using the trained checkpoints. 
+
+
+# Videos 
+## PID controlled hover 
+
+https://github.com/user-attachments/assets/4a06922b-99e3-4d18-b24d-4a863748ade6
+
+## RL Hover (500 iterations)
+
+https://github.com/user-attachments/assets/0863106f-8b25-4cbd-b159-54d819b61174
+
