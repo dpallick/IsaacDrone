@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+import numpy as np
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation
@@ -10,6 +11,7 @@ from isaaclab.sim import SimulationCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
 from isaaclab_assets import CRAZYFLIE_CFG
+from isaaclab.sensors.imu import Imu, ImuCfg
 
 import math
 from pxr import UsdGeom
@@ -57,8 +59,6 @@ class DroneHoverEnv(DirectRLEnv):
 
         self.force_b = torch.zeros(self.num_envs, 1, 3, device=self.device)
         self.torque_b = torch.zeros(self.num_envs, 1, 3, device=self.device)
-        
-        self.prev_lin_vel = torch.zeros(self.num_envs, 3, device=self.device)
 
         self.body_id = self.drone.find_bodies("body")[0]
 
@@ -88,6 +88,7 @@ class DroneHoverEnv(DirectRLEnv):
         print("Joint names:", self.drone.joint_names)
         print("Prop joint ids:", self.prop_joint_ids)
         stage = self.sim.stage
+        self.imu_sensors = None
 
 
 
@@ -103,6 +104,18 @@ class DroneHoverEnv(DirectRLEnv):
 
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0)
         light_cfg.func("/World/Light", light_cfg)
+    
+        self._setup_imu_sensors()
+    
+    def _setup_imu_sensors(self):
+        self.imu_sensors = []
+        for i in range(self.scene.cfg.num_envs):
+            imu_cfg = ImuCfg(
+                prim_path=f"/World/envs/env_{i}/Drone/body",
+            )
+            imu = Imu(cfg=imu_cfg)
+            self.imu_sensors.append(imu)
+        print(f"Created {len(self.imu_sensors)} IMU sensors")
 
     def _pre_physics_step(self, actions: torch.Tensor):
         self.actions = torch.clamp(actions.clone(), 0.0, 1.0)
@@ -176,15 +189,20 @@ class DroneHoverEnv(DirectRLEnv):
         lin_vel_w = root_state[:, 7:10]
         ang_vel_w = root_state[:, 10:13]
         
-        # Compute linear acceleration from velocity changes
-        lin_acc_w = (lin_vel_w - self.prev_lin_vel) / self.cfg.sim.dt
-        self.prev_lin_vel = lin_vel_w.clone()
+        lin_acc_b = torch.zeros(self.num_envs, 3, device=self.device)
+        if self.imu_sensors is not None:
+            for i, imu in enumerate(self.imu_sensors):
+                try:
+                    if imu.data.lin_acc_b is not None:
+                        lin_acc_b[i] = imu.data.lin_acc_b[i]
+                except Exception as e:
+                    pass
 
         z_error = self.cfg.hover_height - pos_w[:, 2:3]
 
         obs = torch.cat(
             [
-                lin_acc_w,
+                lin_acc_b,
                 z_error,
                 quat_w,
                 lin_vel_w,
@@ -225,7 +243,6 @@ class DroneHoverEnv(DirectRLEnv):
 
         self.drone.write_root_pose_to_sim(root_state[:, 0:7], env_ids)
         self.drone.write_root_velocity_to_sim(root_state[:, 7:13], env_ids)
-        self.prev_lin_vel[env_ids] = 0.0
         if hasattr(self, "prop_joint_pos"):
             self.prop_joint_pos[env_ids] = 0.0
         self.drone.reset(env_ids)
