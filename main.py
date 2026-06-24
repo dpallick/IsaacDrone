@@ -70,6 +70,7 @@ def main():
 
     waypoints = sample_waypoints(env.device)
     waypoint_id = 0
+    waypoint_timer = 0.0
     target = waypoints[waypoint_id].unsqueeze(0)
 
     if hasattr(controller, "set_target"):
@@ -79,20 +80,20 @@ def main():
         with torch.inference_mode():
             policy_obs = obs["policy"]
 
-            if args.PID:
-                pos = policy_obs[:, 0:3]
-                dist = torch.linalg.norm(pos - target, dim=-1)
+            # Time-based waypoint switching (position is not available with acceleration observations)
+            waypoint_timer += dt
+            if waypoint_timer > 5.0:
+                waypoint_id += 1
+                waypoint_timer = 0.0
 
-                if dist.item() < 0.15:
-                    waypoint_id += 1
+                if waypoint_id >= 4:
+                    waypoint_id = 0
+                    waypoints = sample_waypoints(env.device)
 
-                    if waypoint_id >= 4:
-                        waypoint_id = 0
-                        waypoints = sample_waypoints(env.device)
-
-                    target = waypoints[waypoint_id].unsqueeze(0)
+                target = waypoints[waypoint_id].unsqueeze(0)
+                if hasattr(controller, "set_target"):
                     controller.set_target(target)
-                    print(f"New target {waypoint_id}: {target.detach().cpu().numpy()}")
+                print(f"New target {waypoint_id}: {target.detach().cpu().numpy()}")
 
             actions = controller.act(policy_obs)
 

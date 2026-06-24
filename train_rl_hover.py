@@ -41,7 +41,7 @@ class Critic(nn.Module):
 
 
 def compute_reward(obs, actions, hover_motor):
-    pos = obs[:, 0:3]
+    accel = obs[:, 0:3]
     z_error = obs[:, 3]
     lin_vel = obs[:, 8:11]
     ang_vel = obs[:, 11:14]
@@ -49,7 +49,7 @@ def compute_reward(obs, actions, hover_motor):
     return (
         1.0
         - 2.0 * torch.abs(z_error)
-        - 0.25 * torch.linalg.norm(pos[:, 0:2], dim=-1)
+        - 0.10 * torch.linalg.norm(accel, dim=-1)
         - 0.10 * torch.linalg.norm(lin_vel, dim=-1)
         - 0.05 * torch.linalg.norm(ang_vel, dim=-1)
         - 0.02 * torch.linalg.norm(actions - hover_motor, dim=-1)

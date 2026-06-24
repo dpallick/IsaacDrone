@@ -57,6 +57,8 @@ class DroneHoverEnv(DirectRLEnv):
 
         self.force_b = torch.zeros(self.num_envs, 1, 3, device=self.device)
         self.torque_b = torch.zeros(self.num_envs, 1, 3, device=self.device)
+        
+        self.prev_lin_vel = torch.zeros(self.num_envs, 3, device=self.device)
 
         self.body_id = self.drone.find_bodies("body")[0]
 
@@ -173,12 +175,16 @@ class DroneHoverEnv(DirectRLEnv):
         quat_w = root_state[:, 3:7]
         lin_vel_w = root_state[:, 7:10]
         ang_vel_w = root_state[:, 10:13]
+        
+        # Compute linear acceleration from velocity changes
+        lin_acc_w = (lin_vel_w - self.prev_lin_vel) / self.cfg.sim.dt
+        self.prev_lin_vel = lin_vel_w.clone()
 
         z_error = self.cfg.hover_height - pos_w[:, 2:3]
 
         obs = torch.cat(
             [
-                pos_w,
+                lin_acc_w,
                 z_error,
                 quat_w,
                 lin_vel_w,
@@ -219,6 +225,7 @@ class DroneHoverEnv(DirectRLEnv):
 
         self.drone.write_root_pose_to_sim(root_state[:, 0:7], env_ids)
         self.drone.write_root_velocity_to_sim(root_state[:, 7:13], env_ids)
+        self.prev_lin_vel[env_ids] = 0.0
         if hasattr(self, "prop_joint_pos"):
             self.prop_joint_pos[env_ids] = 0.0
         self.drone.reset(env_ids)

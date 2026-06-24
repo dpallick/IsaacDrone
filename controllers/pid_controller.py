@@ -51,18 +51,22 @@ class DroneWaypointPID:
         self.target = target_xyz.to(self.device)
 
     def act(self, obs):
-        pos = obs[:, 0:3]
+        # Note: With acceleration-based observations, position tracking is not available.
+        # This controller requires position for waypoint following.
+        # Using acceleration and z_error to estimate altitude control only.
+        accel = obs[:, 0:3]
+        z_error = obs[:, 3:4]
         quat = obs[:, 4:8]
         lin_vel = obs[:, 8:11]
         ang_vel = obs[:, 11:14]
 
         roll, pitch, yaw = quat_to_euler_xyz(quat)
 
-        error = self.target - pos
-
-        x_error = error[:, 0]
-        y_error = error[:, 1]
-        z_error = error[:, 2]
+        # Extract z_error and use lateral acceleration for stability
+        z_error_val = z_error[:, 0]
+        ax = accel[:, 0]
+        ay = accel[:, 1]
+        az = accel[:, 2]
 
         vx = lin_vel[:, 0]
         vy = lin_vel[:, 1]
@@ -72,17 +76,18 @@ class DroneWaypointPID:
         pitch_rate = ang_vel[:, 1]
         yaw_rate = ang_vel[:, 2]
 
-        collective = self.kp_z * z_error - self.kd_z * vz
+        collective = self.kp_z * z_error_val - self.kd_z * vz
         collective = torch.clamp(collective, -0.18, 0.18)
 
+        # Use acceleration damping instead of position tracking
         desired_pitch = torch.clamp(
-            0.01 * x_error - 0.12 * vx,
+            -0.05 * ax - 0.12 * vx,
             -0.03,
             0.03,
         )
 
         desired_roll = torch.clamp(
-            -0.01 * y_error + 0.12 * vy,
+            -0.05 * ay + 0.12 * vy,
             -0.03,
             0.03,
         )
