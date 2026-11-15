@@ -28,11 +28,13 @@ class RLHoverController:
         self.hover_motor = 1.0 / 2.2
         self.residual_scale = 0.15
         obs_dim = 16
+        self.control_mode = "motors"
         state = None
 
         if checkpoint is not None:
-            state = torch.load(checkpoint, map_location=device)
+            state = torch.load(checkpoint, map_location=device, weights_only=False)
             if "actor" in state:
+                self.control_mode = state.get("control_mode", "motors")
                 self.hover_motor = state.get("hover_motor", self.hover_motor)
                 self.residual_scale = state.get("residual_scale", self.residual_scale)
                 obs_dim = state.get("obs_dim", 14)
@@ -51,6 +53,8 @@ class RLHoverController:
         with torch.no_grad():
             residual_raw = self.policy(obs[:, : self.obs_dim])
 
+        if self.control_mode == "ctbr":
+            return torch.clamp(residual_raw, 0.0, 1.0)   # env maps to thrust + body rates
         residual = (residual_raw - 0.5) * self.residual_scale
         actions = self.hover_motor + residual
 

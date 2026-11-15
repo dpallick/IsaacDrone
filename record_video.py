@@ -61,6 +61,8 @@ def main():
     cfg.scene.num_envs = args.num_envs
     cfg.seed = args.seed
     cfg.obs_mode = ck.get("obs_mode", "privileged")
+    # Checkpoints from before thrust/body-rate control commanded motors directly.
+    cfg.control_mode = ck.get("control_mode", "motors")
     cfg.obs_history = ck.get("obs_history", cfg.obs_history)
     if args.net_dropout is not None:
         cfg.tof_net_dropout_range = (args.net_dropout, args.net_dropout)
@@ -97,7 +99,10 @@ def main():
     with torch.inference_mode():
         for t in range(steps + warmup):
             raw = actor(obs["policy"][:, :n_in])
-            actions = torch.clamp(hover + (raw - 0.5) * rscale, 0.0, 1.0)
+            if cfg.control_mode == "ctbr":
+                actions = raw.clamp(0.0, 1.0)
+            else:
+                actions = torch.clamp(hover + (raw - 0.5) * rscale, 0.0, 1.0)
             obs, _, term, trunc, _ = env.step(actions)
             if bool(term[0]):
                 resets += 1

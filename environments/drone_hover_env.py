@@ -20,6 +20,8 @@ from .dd24_params import (DD24, DD24_TOF_SENSORS, TOF_MAX_RANGE_M, TOF_MIN_RANGE
                           TOF_NOISE_STD_M, TOF_NOISE_STD_FRAC)
 from . import arena as A
 from .scenes import SCENARIOS, assign, empty_scenes, sample_scenes, scene_ranges
+from .px4_ctbr import Px4RateController
+from .sensor_timing import HeldSensor
 
 
 def quat_rotate(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
@@ -62,7 +64,9 @@ def tof_ranges(pos_local, quat, sensor_pos_b, sensor_dir_b, half_xy, height):
 @configclass
 class DroneHoverEnvCfg(DirectRLEnvCfg):
     episode_length_s = 20.0
-    decimation = 2
+    # 200 Hz physics (the simulated PX4 rate loop runs every physics step),
+    # 50 Hz policy = the MAVROS node's timer rate.
+    decimation = 4
     action_space = 4
     # ---- What the policy observes ----------------------------------------------
     # "onboard" (default): ONLY what the real drone measures, with its imperfections:
@@ -76,11 +80,11 @@ class DroneHoverEnvCfg(DirectRLEnvCfg):
     # The CRITIC always gets ground truth ("critic" obs). It only exists during
     # training, so this costs nothing on the real drone and makes learning far easier.
     obs_mode = "onboard"
-    obs_history = 4
+    obs_history = 8          # 160 ms: spans 3+ ToF and 2+ flow updates
     observation_space = 0   # set in __post_init__ from obs_mode / sensors / history
     state_space = 0         # set in __post_init__
     sim: SimulationCfg = SimulationCfg(
-        dt=1 / 100,
+        dt=1 / 200,
         render_interval=decimation,
         gravity=(0.0, 0.0, -9.81),
     )
@@ -98,6 +102,30 @@ class DroneHoverEnvCfg(DirectRLEnvCfg):
         prim_path="/World/envs/env_.*/Drone"
     )
     imu: ImuCfg = ImuCfg(prim_path="/World/envs/env_.*/Drone/body")
+
+    # ---- What the policy commands --------------------------------------------
+    # "ctbr" (default): collective thrust + body rates, i.e. what a MAVROS node sends
+    #   on /mavros/setpoint_raw/attitude in OFFBOARD; a simulated PX4 rate controller
+    #   (environments/px4_ctbr.py) turns it into motor commands at 200 Hz.
+    # "motors": the old direct per-motor commands (kept for old checkpoints / PID).
+    # Policy action a in [-1, 1]^4 (from the sigmoid output s: a = 2s - 1):
+    #   thrust = ctbr_thrust_center + a0 * ctbr_thrust_span  (normalised 0..1, PX4 style)
+    #   body rates (FLU, rad/s) = a1..3 * ctbr_max_rates
+    control_mode = "ctbr"
+    ctbr_thrust_center = 0.27
+    ctbr_thrust_span = 0.20
+    ctbr_max_rates = (2.5, 2.5, 1.5)
+    # Per-episode mismatch between this PX4 model and the real one:
+    px4_gain_scale_range = (0.8, 1.2)     # rate P/I/D
+    px4_mix_scale_range = (0.75, 1.25)    # allocation / torque effectiveness
+    motor_tau_range = (0.02, 0.05)        # s, ESC + motor spin-up
+    thrust_curve_k_range = (0.2, 0.6)     # thrust = (1-k) u + k u^2 (THR_MDL_FAC = 0 on the drone)
+
+    # ---- Sensor timing (what the MAVROS node actually receives) -------------------
+    imu_rate_hz_range = (40.0, 60.0)       # /mavros/imu/data
+    imu_latency_s_range = (0.0, 0.03)
+    tof_rate_hz_range = (18.0, 22.0)       # 20 Hz ToFs
+    tof_latency_s_range = (0.03, 0.06)
 
     hover_height = 1.0
     crash_height = A.CRASH_HEIGHT
@@ -146,9 +174,9 @@ class DroneHoverEnvCfg(DirectRLEnvCfg):
     flow_dropout_range = (0.0, 0.3)        # per-episode P(no valid flow): floor texture/light
     flow_height_range = (0.08, 4.0)        # m; outside this the sensor reports invalid
     flow_cam_pos_b = (0.114, -0.004, 0.011)  # m, Pi camera position from the CAD (nose)
-    flow_rate_hz_range = (20.0, 40.0)      # per episode: Pi flow output rate
-    flow_latency_s_range = (0.03, 0.08)    # per episode: image -> PX4 delay
-    flow_max_rate = 3.0                    # rad/s image speed (|v|/h) beyond which tracking fails
+    flow_rate_hz_range = (13.0, 17.0)      # 15 Hz camera -> Pi flow
+    flow_latency_s_range = (0.06, 0.12)    # exposure + Pi processing + transport
+    flow_max_rate = 2.0                    # rad/s image speed (|v|/h) trackable at 15 fps
     flow_rot_residual = 0.05               # fraction of body rate left after gyro de-rotation
 
     # ---- Scenes (re-drawn every episode; see environments/scenes.py) ------------
@@ -212,7 +240,8 @@ class DroneHoverEnvCfg(DirectRLEnvCfg):
     rew_xy = 1.0
     rew_lin_vel = 0.10
     rew_ang_vel = 0.05
-    rew_action = 0.02
+    rew_action = 0.02          # magnitude of body-rate commands
+    rew_action_rate = 0.05     # change in command between steps (smooth = deployable)
     rew_net = 2.0
     rew_crash = 10.0
 
@@ -299,6 +328,8 @@ class DroneHoverEnv(DirectRLEnv):
         """Per-env buffers (sensor layout, randomisation draws, scenes, targets,
         observation history). Separate from __init__ so tests can build them too."""
         self.actions = torch.zeros(self.num_envs, 4, device=self.device)
+        self.force_b = torch.zeros(self.num_envs, 1, 3, device=self.device)
+        self.torque_b = torch.zeros(self.num_envs, 1, 3, device=self.device)
         self._target_local = torch.tensor(
             [0.0, 0.0, self.cfg.hover_height], device=self.device
         )
@@ -315,15 +346,16 @@ class DroneHoverEnv(DirectRLEnv):
         self._tof_ghost_p = torch.zeros(N, 1, device=self.device)
         self._flow_scale = torch.ones(N, 1, device=self.device)
         self._flow_drop_p = torch.zeros(N, 1, device=self.device)
-        # Camera pipeline state: delay line, hold value, frame clock.
         self._flow_cam_r = torch.tensor(self.cfg.flow_cam_pos_b, device=self.device)
-        self._flow_lmax = 6
-        self._flow_buf = torch.zeros(N, self._flow_lmax, 3, device=self.device)
-        self._flow_hold = torch.zeros(N, 3, device=self.device)
-        self._flow_phase = torch.zeros(N, device=self.device)
-        self._flow_rate = torch.full((N,), 30.0, device=self.device)
-        self._flow_lat = torch.zeros(N, dtype=torch.long, device=self.device)
-        self._flow_fill = torch.ones(N, dtype=torch.bool, device=self.device)
+        # What the MAVROS node sees: each topic at its own rate and latency.
+        self._imu_s = HeldSensor(N, 9, 3, self.device)        # accel, gyro, gravity dir
+        self._tof_s = HeldSensor(N, S, 6, self.device)
+        self._flow_s = HeldSensor(N, 3, 8, self.device)
+        # Thrust/body-rate command (a in [-1,1]^4) and the simulated PX4 below it.
+        self._cmd = torch.zeros(N, 4, device=self.device)
+        self._cmd_prev = torch.zeros(N, 4, device=self.device)
+        self._px4 = Px4RateController(N, self.device)
+        self._max_rates = torch.tensor(self.cfg.ctbr_max_rates, device=self.device)
         names = [t[0] for t in self.cfg.tof_sensors]
         self._down_idx = names.index("down") if "down" in names else None
         self._scene = empty_scenes(N, self.cfg.scene_clutter_max, self.device)
@@ -393,9 +425,17 @@ class DroneHoverEnv(DirectRLEnv):
 
     # ---------------------------------------------------------------- actions
     def _pre_physics_step(self, actions: torch.Tensor):
+        if self.cfg.control_mode == "ctbr":
+            # Policy output in [0,1] (sigmoid) -> a in [-1,1]: the setpoint the MAVROS
+            # node would publish. Held for the 4 physics steps until the next policy step.
+            self._cmd_prev = self._cmd.clone()
+            self._cmd = 2.0 * torch.clamp(actions.clone(), 0.0, 1.0) - 1.0
+            return
         self.actions = torch.clamp(actions.clone(), 0.0, 1.0)
-        # Per-motor thrust scale: no two real motors/props are identical.
-        f = self.actions * self.max_motor_thrust * self._thrust_scale
+        self._set_wrench(self.actions * self.max_motor_thrust * self._thrust_scale)
+
+    def _set_wrench(self, f: torch.Tensor):
+        """Body force/torque from per-motor thrusts f (N,4) in newtons."""
         f1, f2, f3, f4 = f[:, 0], f[:, 1], f[:, 2], f[:, 3]
 
         self.force_b.zero_()
@@ -405,7 +445,21 @@ class DroneHoverEnv(DirectRLEnv):
         self.torque_b[:, 0, 1] = self.cfg.arm_length * ((f2 + f3) - (f1 + f4))
         self.torque_b[:, 0, 2] = self.cfg.yaw_coeff * ((f1 + f3) - (f2 + f4))
 
+    def ctbr_setpoint(self, cmd: torch.Tensor):
+        """a in [-1,1]^4 -> (normalised collective thrust (N,1), body rates FLU (N,3)).
+        Exactly what the deployed node writes into mavros_msgs/AttitudeTarget."""
+        thrust = (self.cfg.ctbr_thrust_center + cmd[:, 0:1] * self.cfg.ctbr_thrust_span).clamp(0.0, 1.0)
+        return thrust, cmd[:, 1:4] * self._max_rates
+
     def _apply_action(self):
+        if self.cfg.control_mode == "ctbr":
+            # One tick of the simulated PX4 rate controller (runs every physics step).
+            thrust, rates = self.ctbr_setpoint(self._cmd)
+            gyro = self.drone.data.root_ang_vel_b + self._gyro_bias \
+                + torch.randn_like(self._gyro_bias) * self.cfg.gyro_noise_std
+            frac = self._px4.step(rates, thrust, gyro, self.cfg.sim.dt)
+            self.actions = self._px4.u_act          # motor commands, for logging / prop visuals
+            self._set_wrench(frac * self.max_motor_thrust * self._thrust_scale)
         self.drone.set_external_force_and_torque(
             self.force_b, self.torque_b, body_ids=self.body_id
         )
@@ -474,7 +528,8 @@ class DroneHoverEnv(DirectRLEnv):
 
     def _optical_flow(self, tof_meas: torch.Tensor, tof_true: torch.Tensor) -> torch.Tensor:
         """Pi-camera optical flow as PX4 receives it: body-frame horizontal velocity
-        (N, 2) + valid flag (N, 1), after the camera pipeline (rate, latency).
+        (N, 2) + valid flag (N, 1) at this instant; its 15 Hz rate and latency
+        are applied by a HeldSensor in _get_observations.
 
         velocity = (camera's ground velocity) x (measured / true height) x calibration
                    + noise + leftover rotation, invalid when too low/high, too fast to
@@ -499,21 +554,7 @@ class DroneHoverEnv(DirectRLEnv):
         trackable = (torch.linalg.norm(v_xy, dim=-1, keepdim=True) / h_true.clamp(min=1e-3)) < self.cfg.flow_max_rate
         valid = (h_true > lo) & (h_true < hi) & (h_meas < self.cfg.tof_max_range) & trackable \
             & (torch.rand_like(h_true) >= self._flow_drop_p)
-        raw = torch.cat([torch.where(valid, v, torch.zeros_like(v)), valid.float()], dim=-1)
-
-        # ---- camera pipeline: delay line + frame clock (zero-order hold) ----
-        fill = self._flow_fill
-        if bool(fill.any()):
-            self._flow_buf[fill] = raw[fill][:, None].expand(-1, self._flow_lmax, -1)
-            self._flow_hold[fill] = raw[fill]
-            self._flow_fill[fill] = False
-        self._flow_buf = torch.cat([self._flow_buf[:, 1:], raw[:, None]], dim=1)
-        delayed = self._flow_buf[torch.arange(N, device=self.device), self._flow_lmax - 1 - self._flow_lat]
-        self._flow_phase += self._flow_rate * (self.cfg.sim.dt * self.cfg.decimation)
-        fresh = self._flow_phase >= 1.0
-        self._flow_phase = torch.where(fresh, self._flow_phase - 1.0, self._flow_phase)
-        self._flow_hold = torch.where(fresh[:, None], delayed, self._flow_hold)
-        return self._flow_hold.clone()
+        return torch.cat([torch.where(valid, v, torch.zeros_like(v)), valid.float()], dim=-1)
 
     # ------------------------------------------------------------ observations
     def _get_observations(self):
@@ -544,10 +585,17 @@ class DroneHoverEnv(DirectRLEnv):
             grav = data.projected_gravity_b + self._grav_bias \
                 + torch.randn_like(self._grav_bias) * self.cfg.gravity_dir_noise_std
             grav = grav / torch.linalg.norm(grav, dim=-1, keepdim=True)
-            prev_cmd = (self.actions - self.hover_motor) / self.hover_motor
+            if self.cfg.control_mode == "ctbr":
+                prev_cmd = self._cmd
+            else:
+                prev_cmd = (self.actions - self.hover_motor) / self.hover_motor
             flow = self._optical_flow(tof_m, tof_true)
-            frame = torch.cat([accel, gyro, grav, tof_m / mx, prev_cmd, flow,
-                               self._target[:, 2:3]], dim=-1)
+            # Each topic at its own rate / latency (latest message, like the ROS node).
+            dt = self.cfg.sim.dt * self.cfg.decimation
+            imu = self._imu_s(torch.cat([accel, gyro, grav], dim=-1), dt)
+            tof_h = self._tof_s(tof_m / mx, dt)
+            flow_h = self._flow_s(flow, dt)
+            frame = torch.cat([imu, tof_h, prev_cmd, flow_h, self._target[:, 2:3]], dim=-1)
 
             self._hist = torch.cat([self._hist[:, 1:], frame[:, None]], dim=1)
             fill = self._hist_fill
@@ -592,12 +640,18 @@ class DroneHoverEnv(DirectRLEnv):
             - self.cfg.rew_xy * torch.linalg.norm(err[:, 0:2], dim=-1)
             - self.cfg.rew_lin_vel * torch.linalg.norm(data.root_lin_vel_w, dim=-1)
             - self.cfg.rew_ang_vel * torch.linalg.norm(data.root_ang_vel_b, dim=-1)
-            - self.cfg.rew_action * torch.linalg.norm(self.actions - self.hover_motor, dim=-1)
+            - self._action_penalty()
             - self.cfg.rew_net * net_pen
             # reset_terminated is filled by _get_dones(), which DirectRLEnv calls first.
             - self.cfg.rew_crash * self.reset_terminated.float()
         )
         return reward
+
+    def _action_penalty(self):
+        if self.cfg.control_mode == "ctbr":
+            return (self.cfg.rew_action * torch.linalg.norm(self._cmd[:, 1:4], dim=-1)
+                    + self.cfg.rew_action_rate * torch.linalg.norm(self._cmd - self._cmd_prev, dim=-1))
+        return self.cfg.rew_action * torch.linalg.norm(self.actions - self.hover_motor, dim=-1)
 
     # ------------------------------------------------------------------ dones
     def _get_dones(self):
@@ -661,12 +715,18 @@ class DroneHoverEnv(DirectRLEnv):
         self._tof_ghost_p[env_ids] = u(*c.tof_ghost_range, n, 1)
         self._flow_scale[env_ids] = u(*c.flow_scale_range, n, 1)
         self._flow_drop_p[env_ids] = u(*c.flow_dropout_range, n, 1)
-        self._flow_rate[env_ids] = u(*c.flow_rate_hz_range, n)
         step_dt = c.sim.dt * c.decimation
-        lat = torch.round(u(*c.flow_latency_s_range, n) / step_dt).long()
-        self._flow_lat[env_ids] = lat.clamp(0, self._flow_lmax - 1)
-        self._flow_phase[env_ids] = torch.rand(n, device=dev)
-        self._flow_fill[env_ids] = True
+        steps = lambda rng: torch.round(u(*rng, n) / step_dt).long()   # noqa: E731
+        self._imu_s.reset(env_ids, u(*c.imu_rate_hz_range, n), steps(c.imu_latency_s_range))
+        self._tof_s.reset(env_ids, u(*c.tof_rate_hz_range, n), steps(c.tof_latency_s_range))
+        self._flow_s.reset(env_ids, u(*c.flow_rate_hz_range, n), steps(c.flow_latency_s_range))
+        # PX4 model mismatch for this episode; start the motors near hover, and the
+        # held command at "hover thrust, zero rates" so the first steps are calm.
+        k = u(*c.thrust_curve_k_range, n, 1)
+        self._px4.reset(env_ids, u(*c.px4_gain_scale_range, n, 3), u(*c.px4_mix_scale_range, n, 3),
+                        u(*c.motor_tau_range, n, 1), k, torch.full((n, 1), c.ctbr_thrust_center, device=dev))
+        self._cmd[env_ids] = 0.0
+        self._cmd_prev[env_ids] = 0.0
         self._tof_drop_p[env_ids] = u(*c.tof_net_dropout_range, n, 1)
         self._accel_bias[env_ids] = u(-c.accel_bias_range, c.accel_bias_range, n, 3)
         self._gyro_bias[env_ids] = u(-c.gyro_bias_range, c.gyro_bias_range, n, 3)

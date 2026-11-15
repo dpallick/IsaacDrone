@@ -135,15 +135,22 @@ python rotorpy_dd24/visualize_policy.py --model runs/rotorpy_hover_1114_s0/lates
 ```
 
 ## What the policy is trained on (Isaac)
-Each episode draws a new scene (`environments/scenes.py`): the net alone, the net
-inside a room (beams that miss the net hit the walls or clutter behind it), a room
-with furniture and no net, or an open hall, plus random clutter, ghost returns,
-sensor biases and motor spread. The drone must hold the spot it started at, at a
-random target height (an input). Inputs per step: IMU, attitude, 5 ToFs, last
-motor command, optical-flow velocity (+ valid flag) and target height, stacked
-over 4 steps (88 numbers). Each run is tested three ways: `eval.json` (training
-mix, with a per-scenario breakdown), `eval_net70.json` (ToFs miss the net 70% of
-the time) and `eval_fixednet.json` (the original 3x3 m net).
+**Output = PX4 offboard setpoint:** collective thrust + body rates, what a MAVROS
+node publishes on `/mavros/setpoint_raw/attitude`. Below it, a simulated PX4 rate
+controller (default MC_*RATE gains, IMU_DGYRO_CUTOFF 20 Hz, quad-X allocation from
+`fc_firmware/duckiedrone-px4-v4.params`) runs at 200 Hz with randomised gains,
+motor lag and thrust curve. Policy rate 50 Hz.
+
+**Inputs** (exact layout: `deploy/INTERFACE.md`), each at the rate the node gets it:
+IMU + attitude (~50 Hz), 5 ToFs (20 Hz), Pi-camera optical flow (15 Hz, 60-120 ms
+latency), last command, target height; 8 steps of history (176 numbers).
+
+**Scenes** re-drawn every episode (`environments/scenes.py`): net alone, net inside
+a room, room with furniture, open hall, plus clutter and ghost ToF returns. The
+drone holds the spot it started at, at a random target height.
+
+Each run is tested three ways: `eval.json` (training mix, per-scenario breakdown),
+`eval_net70.json` (ToFs miss the net 70% of the time) and `eval_fixednet.json`.
 
 ## 5. Watching the policy fly (videos)
 ```bash

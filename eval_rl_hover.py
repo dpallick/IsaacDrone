@@ -54,6 +54,8 @@ def main():
     cfg.seed = args.seed
     # Older checkpoints (before onboard mode) were trained on ground-truth inputs.
     cfg.obs_mode = ck.get("obs_mode", "privileged")
+    # Checkpoints from before thrust/body-rate control commanded motors directly.
+    cfg.control_mode = ck.get("control_mode", "motors")
     cfg.obs_history = ck.get("obs_history", cfg.obs_history)
     if args.net_dropout is not None:
         cfg.tof_net_dropout_range = (args.net_dropout, args.net_dropout)
@@ -92,7 +94,10 @@ def main():
     with torch.inference_mode():
         for t in range(T):
             raw = actor(obs["policy"][:, : actor.net[0].in_features])
-            actions = torch.clamp(hover + (raw - 0.5) * rscale, 0.0, 1.0)
+            if cfg.control_mode == "ctbr":
+                actions = raw.clamp(0.0, 1.0)
+            else:
+                actions = torch.clamp(hover + (raw - 0.5) * rscale, 0.0, 1.0)
             obs, _, terminated, truncated, _ = env.step(actions)
 
             live = ~finished

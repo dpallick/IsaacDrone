@@ -33,6 +33,8 @@ parser.add_argument("--lr_max", type=float, default=1e-3)
 parser.add_argument("--scenario", default="random",
                     choices=["random", "net_only", "net_in_room", "room", "open", "fixed_net"],
                     help="Scenes to train in (random = mix of nets, rooms, open halls)")
+parser.add_argument("--control_mode", choices=["ctbr", "motors"], default="ctbr",
+                    help="ctbr = thrust + body rates through a simulated PX4 (deployable via MAVROS)")
 parser.add_argument("--obs_mode", choices=["onboard", "privileged"], default="onboard",
                     help="onboard = only real-drone sensors (default); privileged = ground truth")
 parser.add_argument("--airframe", choices=["crazyflie", "dd24"], default="crazyflie")
@@ -79,6 +81,7 @@ def main():
     env_cfg.seed = args.seed
     env_cfg.obs_mode = args.obs_mode
     env_cfg.scenario = args.scenario
+    env_cfg.control_mode = args.control_mode
     env_cfg.__post_init__()   # recompute observation sizes for the chosen mode
     env_cfg.hover_height = 1.0
 
@@ -127,6 +130,11 @@ def main():
             "obs_mode": args.obs_mode,
             "obs_history": env_cfg.obs_history,
             "scenario": args.scenario,
+            "control_mode": args.control_mode,
+            "ctbr_thrust_center": env_cfg.ctbr_thrust_center,
+            "ctbr_thrust_span": env_cfg.ctbr_thrust_span,
+            "ctbr_max_rates": list(env_cfg.ctbr_max_rates),
+            "policy_hz": 1.0 / (env_cfg.sim.dt * env_cfg.decimation),
             "lr_schedule": args.lr_schedule,
             "hover_motor": hover_motor,
             "residual_scale": residual_scale,
@@ -194,8 +202,11 @@ def main():
                 logprob = dist.log_prob(action_raw).sum(dim=-1)
                 value = critic(critic_in(obs))
 
-                residual = (action_raw_clamped - 0.5) * residual_scale
-                actions = torch.clamp(hover_motor + residual, 0.0, 1.0)
+                if args.control_mode == "ctbr":
+                    actions = action_raw_clamped          # env maps it to thrust + body rates
+                else:
+                    residual = (action_raw_clamped - 0.5) * residual_scale
+                    actions = torch.clamp(hover_motor + residual, 0.0, 1.0)
 
             obs, env_reward, terminated, truncated, info = env.step(actions)
 
