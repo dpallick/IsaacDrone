@@ -27,6 +27,8 @@ parser.add_argument("--airframe", choices=["crazyflie", "dd24"], default=None,
                     help="Defaults to the airframe stored in the checkpoint.")
 parser.add_argument("--num_envs", type=int, default=512)
 parser.add_argument("--seed", type=int, default=12345, help="Different from training seeds.")
+parser.add_argument("--net_dropout", type=float, default=None,
+                    help="Fix P(ToF misses the net) for the test, e.g. 0 or 0.7 (default: training range)")
 parser.add_argument("--out", type=str, default=None, help="JSON path (default: next to checkpoint)")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
@@ -47,6 +49,12 @@ def main():
     cfg = DroneHoverEnvCfgDD24() if airframe == "dd24" else DroneHoverEnvCfg()
     cfg.scene.num_envs = args.num_envs
     cfg.seed = args.seed
+    # Older checkpoints (before onboard mode) were trained on ground-truth inputs.
+    cfg.obs_mode = ck.get("obs_mode", "privileged")
+    cfg.obs_history = ck.get("obs_history", cfg.obs_history)
+    if args.net_dropout is not None:
+        cfg.tof_net_dropout_range = (args.net_dropout, args.net_dropout)
+    cfg.__post_init__()
     env = DroneHoverEnv(cfg=cfg, render_mode=None)
     dev = env.device
     N = env.num_envs
@@ -104,6 +112,8 @@ def main():
     res = {
         "checkpoint": os.path.abspath(args.checkpoint),
         "airframe": airframe,
+        "obs_mode": cfg.obs_mode,
+        "net_dropout_range": list(cfg.tof_net_dropout_range),
         "episodes": N,
         "episode_s": cfg.episode_length_s,
         "success_rate": survived.float().mean().item(),

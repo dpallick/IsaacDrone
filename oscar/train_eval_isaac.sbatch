@@ -57,5 +57,9 @@ fi
 if [ -f "$RUN_DIR/best.pt" ]; then
     isaac_exec "cd '$REPO_DIR' && '$ISAACLAB_DIR/isaaclab.sh' -p eval_rl_hover.py --headless \
         --checkpoint $RUN_DIR/best.pt --num_envs $EVAL_ENVS --out $RUN_DIR/eval.json"
+    # Worst case: the ToFs miss the net 70% of the time.
+    isaac_exec "cd '$REPO_DIR' && '$ISAACLAB_DIR/isaaclab.sh' -p eval_rl_hover.py --headless \
+        --checkpoint $RUN_DIR/best.pt --num_envs $EVAL_ENVS --net_dropout 0.7 \
+        --out $RUN_DIR/eval_net70.json"
 fi
 echo "== $(date) done"

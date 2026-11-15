@@ -63,11 +63,20 @@ class DroneHoverEnvCfg(DirectRLEnvCfg):
     episode_length_s = 20.0
     decimation = 2
     action_space = 4
-    # [imu_acc(3), z_err(1), quat(4), lin_vel(3), gyro_body(3), xy_err(2), tof(S)]
-    # New fields are appended LAST so obs[:, 0:14] keeps the old layout (PID still works).
-    # tof = range / tof_max_range in [0, 1], one per sensor in `tof_sensors`.
-    observation_space = 16 + 1
-    state_space = 0
+    # ---- What the policy observes ----------------------------------------------
+    # "onboard" (default): ONLY what the real drone measures, with its imperfections:
+    #     per step [accel_b(3), gyro_b(3), gravity_dir_b(3), tof(S), prev_cmd(4)]
+    #     stacked over the last `obs_history` policy steps, so velocity has to be
+    #     inferred from how the readings change. No ground-truth height / position /
+    #     velocity. tof = range / tof_max_range in [0, 1].
+    # "privileged": the old ground-truth layout, kept for the PID demo:
+    #     [imu_acc(3), z_err(1), quat(4), lin_vel(3), gyro_b(3), xy_err(2), tof(S)]
+    # The CRITIC always gets ground truth ("critic" obs). It only exists during
+    # training, so this costs nothing on the real drone and makes learning far easier.
+    obs_mode = "onboard"
+    obs_history = 4
+    observation_space = 0   # set in __post_init__ from obs_mode / sensors / history
+    state_space = 0         # set in __post_init__
     sim: SimulationCfg = SimulationCfg(
         dt=1 / 100,
         render_interval=decimation,
@@ -105,9 +114,20 @@ class DroneHoverEnvCfg(DirectRLEnvCfg):
     tof_min_range = TOF_MIN_RANGE_M
     tof_noise_std = TOF_NOISE_STD_M
     tof_noise_frac = TOF_NOISE_STD_FRAC
-    # [TODO] How often an IR ToF fails to see the NET (sparse mesh) and reports
-    # "out of range" instead. 0 = net always detected like a solid wall.
-    tof_net_dropout = 0.0
+
+    # ---- Domain randomisation: re-drawn every episode -------------------------
+    # The net is a sparse mesh, so an IR ToF may or may not see it. Each episode
+    # draws P(net reading -> "no target") from this range, so the policy learns to
+    # fly whether the net shows up on the ToFs always, sometimes, or rarely.
+    tof_net_dropout_range = (0.0, 0.7)
+    tof_glitch_prob = 0.01                 # random "no target" on any ToF reading
+    accel_noise_std = 0.05                 # m/s^2, white noise per reading
+    accel_bias_range = 0.10                # m/s^2, constant offset per episode
+    gyro_noise_std = 0.01                  # rad/s
+    gyro_bias_range = 0.01                 # rad/s (gyros drift; this is the slow part)
+    gravity_dir_noise_std = 0.01           # attitude estimate (roll/pitch) error...
+    gravity_dir_bias_range = 0.03          # ...incl. ~2 deg IMU mounting misalignment
+    thrust_scale_range = (0.90, 1.10)      # per motor: motor/prop/battery spread, mass error
 
     # Prop prims to spin for visuals. Missing prims just disable the effect.
     prop_visual_paths = (
@@ -148,6 +168,22 @@ class DroneHoverEnvCfg(DirectRLEnvCfg):
     rew_crash = 10.0
 
 
+    def __post_init__(self):
+        parent = getattr(super(), "__post_init__", None)
+        if parent is not None:
+            parent()
+        S = len(self.tof_sensors)
+        if self.obs_mode == "onboard":
+            self.observation_space = (13 + S) * self.obs_history
+        elif self.obs_mode == "privileged":
+            self.observation_space = 16 + S
+        else:
+            raise ValueError(f"obs_mode must be 'onboard' or 'privileged', not {self.obs_mode!r}")
+        # critic: rel. position(3), velocity(3), quat(4), body rates(3), true ToF(S),
+        # this episode's net-dropout prob(1) and motor thrust scales(4)
+        self.state_space = 18 + S
+
+
 @configclass
 class DroneHoverEnvCfgDD24(DroneHoverEnvCfg):
     """DD24 airframe config.
@@ -164,7 +200,6 @@ class DroneHoverEnvCfgDD24(DroneHoverEnvCfg):
     prop_visual_paths = ("m1_prop", "m2_prop", "m3_prop", "m4_prop")
     # Five ToFs at their CAD positions (see dd24_params.DD24_TOF_SENSORS).
     tof_sensors = DD24_TOF_SENSORS
-    observation_space = 16 + len(DD24_TOF_SENSORS)
 
     def __post_init__(self):
         super().__post_init__()
@@ -203,8 +238,17 @@ class DroneHoverEnv(DirectRLEnv):
         self._tof_pos_b = torch.tensor([t[1] for t in self.cfg.tof_sensors], device=self.device)
         self._tof_dir_b = torch.tensor([t[2] for t in self.cfg.tof_sensors], device=self.device)
         self._tof_dir_b = self._tof_dir_b / torch.linalg.norm(self._tof_dir_b, dim=-1, keepdim=True)
-        assert self.cfg.observation_space == 16 + len(self.cfg.tof_sensors), \
-            "observation_space must be 16 + number of ToF sensors"
+        N, S = self.num_envs, len(self.cfg.tof_sensors)
+        # Per-episode randomisation draws (filled in _reset_idx).
+        self._tof_drop_p = torch.zeros(N, 1, device=self.device)
+        self._accel_bias = torch.zeros(N, 3, device=self.device)
+        self._gyro_bias = torch.zeros(N, 3, device=self.device)
+        self._grav_bias = torch.zeros(N, 3, device=self.device)
+        self._thrust_scale = torch.ones(N, 4, device=self.device)
+        # Observation history for "onboard" mode.
+        self._frame_dim = 13 + S
+        self._hist = torch.zeros(N, self.cfg.obs_history, self._frame_dim, device=self.device)
+        self._hist_fill = torch.ones(N, dtype=torch.bool, device=self.device)
         self._half_xy = torch.tensor(
             [self.cfg.arena_size_xy[0] / 2.0, self.cfg.arena_size_xy[1] / 2.0],
             device=self.device,
@@ -245,7 +289,8 @@ class DroneHoverEnv(DirectRLEnv):
     # ---------------------------------------------------------------- actions
     def _pre_physics_step(self, actions: torch.Tensor):
         self.actions = torch.clamp(actions.clone(), 0.0, 1.0)
-        f = self.actions * self.max_motor_thrust
+        # Per-motor thrust scale: no two real motors/props are identical.
+        f = self.actions * self.max_motor_thrust * self._thrust_scale
         f1, f2, f3, f4 = f[:, 0], f[:, 1], f[:, 2], f[:, 3]
 
         self.force_b.zero_()
@@ -296,45 +341,72 @@ class DroneHoverEnv(DirectRLEnv):
             d = torch.minimum(d, self.cfg.arena_height - pos_local[:, 2])
         return d
 
-    def _tof_readings(self, pos_local: torch.Tensor) -> torch.Tensor:
-        """Simulated ToF measurements (m): true range + noise, clipped to the sensor's
-        limits, with optional dropouts when the target is the net."""
+    def _tof_readings(self, pos_local: torch.Tensor):
+        """Simulated ToF measurements (m) and the true ranges.
+
+        measured = true range + distance-dependent noise, clipped to the sensor's
+        limits; readings whose target is the NET drop to "no target" (max range) with
+        this episode's probability; any reading can glitch to "no target"."""
         rng, hit_net = tof_ranges(pos_local, self.drone.data.root_quat_w, self._tof_pos_b,
                                   self._tof_dir_b, self._half_xy, self.cfg.arena_height)
+        mx = self.cfg.tof_max_range
         noise = torch.randn_like(rng) * (self.cfg.tof_noise_std + self.cfg.tof_noise_frac * rng.clamp(max=10.0))
         meas = rng + noise
-        if self.cfg.tof_net_dropout > 0:
-            drop = hit_net & (torch.rand_like(rng) < self.cfg.tof_net_dropout)
-            meas = torch.where(drop, torch.full_like(meas, self.cfg.tof_max_range), meas)
-        # Beyond max range a real ToF reports "no target"; encode that as max range.
-        meas = torch.where(rng > self.cfg.tof_max_range, torch.full_like(meas, self.cfg.tof_max_range), meas)
-        return meas.clamp(self.cfg.tof_min_range, self.cfg.tof_max_range)
+        drop = hit_net & (torch.rand_like(rng) < self._tof_drop_p)
+        drop |= torch.rand_like(rng) < self.cfg.tof_glitch_prob
+        drop |= rng > mx                     # beyond range: "no target"
+        meas = torch.where(drop, torch.full_like(meas, mx), meas)
+        return meas.clamp(self.cfg.tof_min_range, mx), rng.clamp(max=mx)
 
     # ------------------------------------------------------------ observations
     def _get_observations(self):
         pos = self._local_pos()
         data = self.drone.data
-        lin_acc_b = self.imu.data.lin_acc_b  # includes gravity, like a real IMU
-        z_error = self.cfg.hover_height - pos[:, 2:3]
-        xy_error = -pos[:, 0:2]               # target (0,0) minus position
+        tof_m, tof_true = self._tof_readings(pos)
+        mx = self.cfg.tof_max_range
 
-        # Rotation rates as a real gyro reports them: in the drone's own (body) axes.
-        gyro_b = self.imu.data.ang_vel_b
-        tof = self._tof_readings(pos) / self.cfg.tof_max_range
-
-        obs = torch.cat(
-            [
-                lin_acc_b,
-                z_error,
+        if self.cfg.obs_mode == "privileged":
+            policy = torch.cat([
+                self.imu.data.lin_acc_b,
+                self.cfg.hover_height - pos[:, 2:3],
                 data.root_quat_w,
                 data.root_lin_vel_w,
-                gyro_b,
-                xy_error,
-                tof,
-            ],
-            dim=-1,
-        )
-        return {"policy": obs}
+                self.imu.data.ang_vel_b,
+                -pos[:, 0:2],
+                tof_m / mx,
+            ], dim=-1)
+        else:
+            # What the flight controller actually has, with realistic errors.
+            accel = self.imu.data.lin_acc_b + self._accel_bias \
+                + torch.randn_like(self._accel_bias) * self.cfg.accel_noise_std      # incl. gravity, like a real IMU
+            gyro = self.imu.data.ang_vel_b + self._gyro_bias \
+                + torch.randn_like(self._gyro_bias) * self.cfg.gyro_noise_std        # body axes
+            # Roll/pitch from the attitude estimate as the direction of gravity in the
+            # body frame. Drift-free on a real drone (accelerometer-corrected), unlike
+            # yaw or integrated position, so it's safe to give the policy.
+            grav = data.projected_gravity_b + self._grav_bias \
+                + torch.randn_like(self._grav_bias) * self.cfg.gravity_dir_noise_std
+            grav = grav / torch.linalg.norm(grav, dim=-1, keepdim=True)
+            prev_cmd = (self.actions - self.hover_motor) / self.hover_motor
+            frame = torch.cat([accel, gyro, grav, tof_m / mx, prev_cmd], dim=-1)
+
+            self._hist = torch.cat([self._hist[:, 1:], frame[:, None]], dim=1)
+            fill = self._hist_fill
+            if bool(fill.any()):   # fresh episode: history = copies of the first reading
+                self._hist[fill] = frame[fill][:, None].expand(-1, self.cfg.obs_history, -1)
+                self._hist_fill[fill] = False
+            policy = self._hist.reshape(self.num_envs, -1)
+
+        critic = torch.cat([
+            pos - self._target_local,
+            data.root_lin_vel_w,
+            data.root_quat_w,
+            data.root_ang_vel_b,
+            tof_true / mx,
+            self._tof_drop_p,
+            self._thrust_scale,
+        ], dim=-1)
+        return {"policy": policy, "critic": critic}
 
     # ----------------------------------------------------------------- reward
     def _get_rewards(self):
@@ -404,3 +476,12 @@ class DroneHoverEnv(DirectRLEnv):
         self.drone.write_root_velocity_to_sim(root_state[:, 7:13], env_ids)
         self.drone.reset(env_ids)
         self.actions[env_ids] = self.hover_motor if hasattr(self, "hover_motor") else 0.0
+
+        # New random sensor/motor imperfections for this episode.
+        c = self.cfg
+        self._tof_drop_p[env_ids] = u(*c.tof_net_dropout_range, n, 1)
+        self._accel_bias[env_ids] = u(-c.accel_bias_range, c.accel_bias_range, n, 3)
+        self._gyro_bias[env_ids] = u(-c.gyro_bias_range, c.gyro_bias_range, n, 3)
+        self._grav_bias[env_ids] = u(-c.gravity_dir_bias_range, c.gravity_dir_bias_range, n, 3)
+        self._thrust_scale[env_ids] = u(*c.thrust_scale_range, n, 4)
+        self._hist_fill[env_ids] = True

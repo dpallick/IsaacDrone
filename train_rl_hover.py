@@ -24,6 +24,8 @@ parser.add_argument("--time_limit_min", type=float, default=0.0,
                     help="Stop cleanly (saving latest.pt) after this many minutes; 0 = no limit.")
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--lr", type=float, default=3e-4)
+parser.add_argument("--obs_mode", choices=["onboard", "privileged"], default="onboard",
+                    help="onboard = only real-drone sensors (default); privileged = ground truth")
 parser.add_argument("--airframe", choices=["crazyflie", "dd24"], default="crazyflie")
 parser.add_argument("--residual_frac", type=float, default=0.33,
                     help="Policy thrust authority around hover, as a fraction of the hover command.")
@@ -66,14 +68,22 @@ def main():
     env_cfg = DroneHoverEnvCfgDD24() if args.airframe == "dd24" else DroneHoverEnvCfg()
     env_cfg.scene.num_envs = args.num_envs
     env_cfg.seed = args.seed
+    env_cfg.obs_mode = args.obs_mode
+    env_cfg.__post_init__()   # recompute observation sizes for the chosen mode
     env_cfg.hover_height = 1.0
 
     env = DroneHoverEnv(cfg=env_cfg, render_mode=None)
     device = env.device
     obs_dim = env_cfg.observation_space
+    # Asymmetric actor-critic: the critic sees ground truth (training only).
+    critic_dim = env_cfg.state_space or obs_dim
+    print(f"obs_mode={args.obs_mode} actor inputs={obs_dim} critic inputs={critic_dim}")
+
+    def critic_in(o):
+        return o["critic"] if "critic" in o else o["policy"]
 
     actor = RLHoverActor(obs_dim=obs_dim, action_dim=4).to(device)
-    critic = Critic(obs_dim=obs_dim).to(device)
+    critic = Critic(obs_dim=critic_dim).to(device)
 
     log_std = nn.Parameter(torch.ones(4, device=device) * -2.5)
 
@@ -103,6 +113,9 @@ def main():
             "iter": it,
             "best_reward": best_reward,
             "obs_dim": obs_dim,
+            "critic_dim": critic_dim,
+            "obs_mode": args.obs_mode,
+            "obs_history": env_cfg.obs_history,
             "hover_motor": hover_motor,
             "residual_scale": residual_scale,
             "airframe": args.airframe,
@@ -144,6 +157,7 @@ def main():
 
     for it in range(start_it, args.iters):
         obs_buf = []
+        crit_buf = []
         action_raw_buf = []
         logprob_buf = []
         reward_buf = []
@@ -155,6 +169,7 @@ def main():
 
         for _ in range(args.steps):
             policy_obs = obs["policy"]
+            obs_prev = obs
 
             with torch.no_grad():
                 mean = actor(policy_obs)
@@ -164,7 +179,7 @@ def main():
                 action_raw = dist.sample()
                 action_raw_clamped = torch.clamp(action_raw, 0.0, 1.0)
                 logprob = dist.log_prob(action_raw).sum(dim=-1)
-                value = critic(policy_obs)
+                value = critic(critic_in(obs))
 
                 residual = (action_raw_clamped - 0.5) * residual_scale
                 actions = torch.clamp(hover_motor + residual, 0.0, 1.0)
@@ -177,6 +192,7 @@ def main():
             done = terminated | truncated
 
             obs_buf.append(policy_obs)
+            crit_buf.append(critic_in(obs_prev))
             action_raw_buf.append(action_raw)
             logprob_buf.append(logprob)
             reward_buf.append(reward)
@@ -191,9 +207,10 @@ def main():
             n_net += env.term_net.float().sum()
 
         with torch.no_grad():
-            next_value = critic(obs["policy"])
+            next_value = critic(critic_in(obs))
 
         obs_buf = torch.stack(obs_buf)
+        crit_buf = torch.stack(crit_buf)
         action_raw_buf = torch.stack(action_raw_buf)
         logprob_buf = torch.stack(logprob_buf)
         reward_buf = torch.stack(reward_buf)
@@ -216,6 +233,7 @@ def main():
         returns = advantages + value_buf
 
         b_obs = obs_buf.reshape(-1, obs_dim)
+        b_crit = crit_buf.reshape(-1, critic_dim)
         b_actions_raw = action_raw_buf.reshape(-1, 4)
         b_old_logprob = logprob_buf.reshape(-1)
         b_advantages = advantages.reshape(-1)
@@ -251,7 +269,7 @@ def main():
 
                 policy_loss = torch.max(pg_loss_1, pg_loss_2).mean()
 
-                new_value = critic(b_obs[mb_idx])
+                new_value = critic(b_crit[mb_idx])
                 value_loss = 0.5 * ((new_value - b_returns[mb_idx]) ** 2).mean()
 
                 loss = policy_loss + value_coef * value_loss - entropy_coef * entropy
