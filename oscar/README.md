@@ -77,6 +77,17 @@ Isaac Sim can't live in a venv on Oscar. Its pip wheels need GLIBC >= 2.35, newe
 than Oscar's OS. So Isaac runs from the Apptainer image, and the venv is for RotorPy
 (CPU) and for looking at results.
 
+### Big run in one command (recommended)
+```bash
+cd ~/IsaacDrone && git pull
+ITERS=10000 SEEDS=0-2 MAIL_USER=you@brown.edu bash oscar/smoke_then_overnight.sh
+```
+Runs a 40-min smoke test, checks it (`oscar/check_smoke.py`: all four tests ran,
+learning rate not pinned, KL sane) and only then launches the long Isaac run.
+`cat oscar/logs/gate_*.out` shows the decision. ~4.5 s/iteration on an A5000 with
+1024 envs: 10000 iterations = ~12.5 h per seed (one automatic resubmit), two seeds
+at a time on a free account.
+
 ### Submit everything before you leave
 ```bash
 cd ~/IsaacDrone && git pull
