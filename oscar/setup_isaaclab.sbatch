@@ -35,6 +35,13 @@ isaac_exec "
         echo \"Installing torch 2.7.0+cu128 into the user site (found: \${TV:-none})\"
         \$PY -m pip install --user torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cu128
     fi
+    # Isaac Lab pins flatdict==4.0.1, whose setup.py imports pkg_resources. Recent
+    # setuptools removed pkg_resources, and pip builds packages in a fresh env with
+    # the LATEST setuptools, so flatdict fails and core isaaclab never installs.
+    # Pre-build it here with an older setuptools and no build isolation; the
+    # installer then finds flatdict already satisfied and skips the broken build.
+    \$PY -m pip install --user --quiet 'setuptools<81' wheel
+    \$PY -m pip install --user --no-build-isolation flatdict==4.0.1
     cd '$ISAACLAB_DIR'
     # 'none' = core Isaac Lab only (we bring our own PPO); much faster install.
     ./isaaclab.sh --install none
