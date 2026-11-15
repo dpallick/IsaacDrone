@@ -1,67 +1,84 @@
-# Running IsaacDrone (Isaac Sim) on Oscar
+# Running IsaacDrone (Isaac Sim 5.0 / Isaac Lab 2.2) on Oscar
 
-Dylan's env is **Isaac Sim / Isaac Lab** — Linux + **RTX NVIDIA GPU** only, so it
-can't run on the Mac. Oscar (Brown CCV) has the right hardware. This directory
-ports the headless training (`train_rl_hover.py`) to a SLURM + Apptainer job.
+Isaac Sim needs Linux + an RTX NVIDIA GPU, so training runs on Oscar inside an
+Apptainer container. Everything large (image, caches, pip installs) lives in
+`~/scratch`, not your home quota.
 
-> `main.py` uses `render_mode="human"` (needs a display) — that's for local
-> visualization, **not** Oscar. On Oscar we only run `train_rl_hover.py --headless`.
+```
+build_sif.sh             one-time: pull Isaac Sim 5.0 image -> .sif
+setup_isaaclab.sbatch    one-time: clone Isaac Lab v2.2.1, install into container python
+convert_dd24.sbatch      DD24 URDF -> USD (re-run whenever mass/inertia/mesh change)
+train_hover.sbatch       PPO hover training (headless)
+common.sh                shared paths + the apptainer wrapper (sourced by the above)
+```
 
-## The one gotcha that will bite you: GPU class
-Isaac Sim's renderer needs **RT cores**. Oscar GPUs split:
-
-| Have RT cores — USE THESE | No RT cores — WON'T WORK |
-|---|---|
-| L40S, A6000, A40, A5000 | A100, V100, H100, B200 |
-
-So the job requests `--constraint=l40s|a6000|a40|a5000` and the `gpu` partition.
-The high-end `gpu-he` (V100) partition is **unusable** for Isaac Sim.
-
-## One-time setup (on Oscar, not the Mac)
+## 0. GPU type: check what your account can actually get
+Isaac Sim needs RT cores: A6000 / A40 / A5000 / RTX 3090 work. V100 / A100 / H100
+do not. Slurm rejects a job whose `--constraint` names a feature that no node has,
+so list the real tags first:
 ```bash
-# 1. Get the code onto Oscar
+sinfo -p gpu -o "%f" | tr ',' '\n' | sort -u
+```
+Edit the `#SBATCH --constraint=` line in `train_hover.sbatch` to match, or override
+it: `sbatch --constraint="a5000|geforce3090" oscar/train_hover.sbatch`.
+(Exploratory accounts get the `gpu` partition. `gpu-he` needs a High-End priority account.)
+
+## 1. One-time setup
+```bash
 git clone https://github.com/zyan27/IsaacDrone.git ~/IsaacDrone
+cd ~/IsaacDrone && mkdir -p oscar/logs
 
-# 2. Build the Isaac Sim image (needs a free NGC account + API key)
-#    apptainer remote login --username '$oauthtoken' docker://nvcr.io
-bash ~/IsaacDrone/oscar/build_sif.sh          # -> ~/scratch/isaac/isaac-sim-*.sif
+# Isaac Sim image from NGC (free account + API key):
+apptainer remote login --username '$oauthtoken' docker://nvcr.io   # paste NGC key
+bash oscar/build_sif.sh                 # -> ~/scratch/isaac/isaac-sim-5.0.0.sif (~10+ GB)
 
-# 3. Clone Isaac Lab (version MUST match the repo; Isaac Sim 5.0 / Isaac Lab 2.x)
-git clone https://github.com/isaac-sim/IsaacLab.git ~/scratch/isaac/IsaacLab
-cd ~/scratch/isaac/IsaacLab
-ln -s /isaac-sim _isaac_sim                   # point Isaac Lab at the in-container sim
-# install Isaac Lab into the container's python (run once, inside the .sif):
-apptainer exec --nv --env ACCEPT_EULA=Y ~/scratch/isaac/isaac-sim-5.0.0.sif \
-    bash -lc "cd ~/scratch/isaac/IsaacLab && ./isaaclab.sh -i"
+sbatch oscar/setup_isaaclab.sbatch      # clones Isaac Lab v2.2.1 + installs it
+tail -f oscar/logs/isaaclab_setup_*.out # wait for "Isaac Lab OK"
 ```
 
-## Train
+## 2. Build the DD24 asset (mesh + inertia -> URDF -> USD)
+The URDF step is plain Python and can run anywhere (laptop or Oscar login node):
 ```bash
-cd ~/IsaacDrone
-sbatch oscar/train_hover.sbatch
-# override defaults:  NUM_ENVS=512 ITERS=4000 sbatch oscar/train_hover.sbatch
-squeue -u $USER            # watch it
-tail -f oscar/logs/dd24_hover_*.out
+python assets/dd24/build_dd24_urdf.py \
+    --mesh path/to/dd24.stl --mesh-scale 0.001 \
+    --cg 0 0 0.012 \
+    --inertia IXX IYY IZZ            # kg*m^2 about the CG (optionally + IXY IXZ IYZ)
 ```
-Checkpoint lands at `checkpoints/rl_hover.pt`.
-
-## Things to verify for YOUR Oscar account (I can't from here)
-1. **Compute-node internet.** Isaac Sim pulls assets from NVIDIA Nucleus on first
-   run. If Oscar's `gpu` nodes have no outbound internet, the first run hangs/fails
-   — you'll need to pre-cache assets on a login node or set a local asset root.
-   (The cache binds in the sbatch help on repeat runs but not the first fetch.)
-2. **Apptainer availability.** CCV docs say it's on GPU nodes with no module; if
-   `apptainer: command not found`, add `module load apptainer` to the sbatch.
-3. **Version match.** If `import isaaclab` / `isaaclab_assets` (CRAZYFLIE_CFG)
-   errors, the .sif Isaac Sim tag and the Isaac Lab clone are mismatched to the
-   repo. Pin all three to the same Isaac Sim 5.0 generation.
-4. **Scratch quota.** The .sif is ~10+ GB and the asset cache grows — keep both
-   under `~/scratch`, never `~` (home quota is small).
-
-## Pull the result back to the Mac
+Then convert on a GPU node:
 ```bash
-scp YOURID@ssh.ccv.brown.edu:~/IsaacDrone/checkpoints/rl_hover.pt ./checkpoints/
+sbatch oscar/convert_dd24.sbatch        # -> assets/dd24/dd24.usd
 ```
-Then visualize locally with `main.py --RLHover --rl_checkpoint ...` **only** if you
-have a Linux+RTX box; the Mac still can't render Isaac Sim. For a quick look at the
-learning curve, the sbatch `.out` log prints per-iter reward.
+Also update `Ixx/Iyy/Izz` in `environments/dd24_params.py` so RotorPy uses the
+same numbers.
+
+## 3. Train
+```bash
+sbatch oscar/train_hover.sbatch                                   # DD24, 1024 envs
+AIRFRAME=crazyflie NUM_ENVS=512 ITERS=500 sbatch oscar/train_hover.sbatch   # sanity run
+squeue -u $USER
+tail -f oscar/logs/dd24_hover_*.out    # reward, ep_len (should climb toward 1000)
+```
+At startup the env prints the mass and body inertia that PhysX read from the
+USD. Check them against your measurements.
+
+Checkpoints are saved to `checkpoints/<airframe>_hover_<jobid>.pt`. To pull one back:
+```bash
+scp YOURID@ssh.ccv.brown.edu:~/IsaacDrone/checkpoints/dd24_hover_*.pt ./checkpoints/
+```
+
+## Recommended first run
+Start with a 30-minute `AIRFRAME=crazyflie ITERS=200` job. It checks the container,
+the Isaac Lab install, and Nucleus asset access (the Crazyflie mesh and ground
+plane download on first run) before you spend an 8-hour allocation.
+
+## Troubleshooting
+* **Job rejected / "Invalid feature specification"**: the constraint names a GPU
+  tag that doesn't exist. See step 0.
+* **First run hangs at asset loading**: compute nodes need outbound HTTPS to
+  NVIDIA's asset server for the Crazyflie USD and ground plane. Run once
+  interactively (`interact -q gpu -g 1 -t 1:00:00`) to warm `~/scratch/isaac/cache`.
+* **`No module named isaaclab`** during training: the setup job's user install
+  didn't land in `$PYUSER`. Check its log for `user site enabled: False`. If
+  you see that, ask me for the overlay-image variant.
+* **`apptainer: command not found`**: CCV ships Apptainer natively on compute
+  nodes. Make sure you are on a compute node, not a login node.

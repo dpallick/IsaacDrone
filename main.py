@@ -9,6 +9,7 @@ controller_group = parser.add_mutually_exclusive_group(required=True)
 controller_group.add_argument("--PID", action="store_true")
 controller_group.add_argument("--RLHover", action="store_true")
 
+parser.add_argument("--airframe", choices=["crazyflie", "dd24"], default="crazyflie")
 parser.add_argument(
     "--rl_checkpoint",
     type=str,
@@ -25,7 +26,7 @@ simulation_app = app_launcher.app
 
 import torch
 
-from environments.drone_hover_env import DroneHoverEnv, DroneHoverEnvCfg
+from environments.drone_hover_env import DroneHoverEnv, DroneHoverEnvCfg, DroneHoverEnvCfgDD24
 from controllers.pid_controller import DroneWaypointPID
 from controllers.rl_hover_controller import RLHoverController
 
@@ -39,7 +40,7 @@ def sample_waypoints(device):
 
 
 def main():
-    env_cfg = DroneHoverEnvCfg()
+    env_cfg = DroneHoverEnvCfgDD24() if args.airframe == "dd24" else DroneHoverEnvCfg()
 
     env = DroneHoverEnv(
         cfg=env_cfg,
@@ -53,6 +54,7 @@ def main():
             dt=dt,
             device=env.device,
         )
+        controller.hover_motor = env.hover_motor  # airframe-specific hover command
         print("Using PID controller")
 
     elif args.RLHover:
@@ -100,7 +102,7 @@ def main():
             obs, reward, terminated, truncated, info = env.step(actions)
 
             if torch.any(terminated | truncated):
-                obs, _ = env.reset()
+                # env already auto-reset the finished env inside step()
                 controller.reset(env.num_envs)
 
                 waypoint_id = 0

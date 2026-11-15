@@ -10,6 +10,9 @@ parser.add_argument("--steps", type=int, default=128)
 parser.add_argument("--epochs", type=int, default=4)
 parser.add_argument("--minibatch_size", type=int, default=1024)
 parser.add_argument("--save_path", type=str, default="checkpoints/rl_hover.pt")
+parser.add_argument("--airframe", choices=["crazyflie", "dd24"], default="crazyflie")
+parser.add_argument("--residual_frac", type=float, default=0.33,
+                    help="Policy thrust authority around hover, as a fraction of the hover command.")
 
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
@@ -21,7 +24,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from environments.drone_hover_env import DroneHoverEnv, DroneHoverEnvCfg
+from environments.drone_hover_env import DroneHoverEnv, DroneHoverEnvCfg, DroneHoverEnvCfgDD24
 from controllers.rl_hover_controller import RLHoverActor
 
 
@@ -40,32 +43,17 @@ class Critic(nn.Module):
         return self.net(obs).squeeze(-1)
 
 
-def compute_reward(obs, actions, hover_motor):
-    accel = obs[:, 0:3]
-    z_error = obs[:, 3]
-    lin_vel = obs[:, 8:11]
-    ang_vel = obs[:, 11:14]
-
-    return (
-        1.0
-        - 2.0 * torch.abs(z_error)
-        - 0.10 * torch.linalg.norm(accel, dim=-1)
-        - 0.10 * torch.linalg.norm(lin_vel, dim=-1)
-        - 0.05 * torch.linalg.norm(ang_vel, dim=-1)
-        - 0.02 * torch.linalg.norm(actions - hover_motor, dim=-1)
-    )
-
-
 def main():
-    env_cfg = DroneHoverEnvCfg()
+    env_cfg = DroneHoverEnvCfgDD24() if args.airframe == "dd24" else DroneHoverEnvCfg()
     env_cfg.scene.num_envs = args.num_envs
     env_cfg.hover_height = 1.0
 
     env = DroneHoverEnv(cfg=env_cfg, render_mode=None)
     device = env.device
+    obs_dim = env_cfg.observation_space
 
-    actor = RLHoverActor(obs_dim=14, action_dim=4).to(device)
-    critic = Critic(obs_dim=14).to(device)
+    actor = RLHoverActor(obs_dim=obs_dim, action_dim=4).to(device)
+    critic = Critic(obs_dim=obs_dim).to(device)
 
     log_std = nn.Parameter(torch.ones(4, device=device) * -2.5)
 
@@ -80,8 +68,11 @@ def main():
     value_coef = 0.5
     entropy_coef = 0.01
 
-    hover_motor = 1.0 / 2.2
-    residual_scale = 0.15
+    # Hover command comes from the airframe's thrust-to-weight (was hard-coded to
+    # the Crazyflie's 1/2.2, which makes a DD24 permanently over-thrust).
+    hover_motor = env.hover_motor
+    residual_scale = 2.0 * args.residual_frac * hover_motor
+    print(f"hover_motor={hover_motor:.3f} residual_scale={residual_scale:.3f}")
 
     obs, _ = env.reset()
     best_reward = -1e9
@@ -93,6 +84,7 @@ def main():
         reward_buf = []
         done_buf = []
         value_buf = []
+        ep_done_buf = []
 
         for _ in range(args.steps):
             policy_obs = obs["policy"]
@@ -111,9 +103,10 @@ def main():
                 actions = torch.clamp(hover_motor + residual, 0.0, 1.0)
 
             obs, env_reward, terminated, truncated, info = env.step(actions)
-            next_obs = obs["policy"]
 
-            reward = compute_reward(next_obs, actions, hover_motor)
+            # Reward is computed inside the env from ground-truth state, and
+            # includes the net/geofence and crash penalties.
+            reward = env_reward
             done = terminated | truncated
 
             obs_buf.append(policy_obs)
@@ -123,8 +116,10 @@ def main():
             done_buf.append(done.float())
             value_buf.append(value)
 
-            if torch.any(done):
-                obs, _ = env.reset()
+            # DirectRLEnv already auto-resets only the finished envs inside step().
+            # (The old global env.reset() here restarted ALL envs whenever ANY
+            # one crashed, so episodes almost never got long.)
+            ep_done_buf.append(done.float())
 
         with torch.no_grad():
             next_value = critic(obs["policy"])
@@ -140,12 +135,10 @@ def main():
         last_gae = torch.zeros(args.num_envs, device=device)
 
         for t in reversed(range(args.steps)):
-            if t == args.steps - 1:
-                next_nonterminal = 1.0 - done_buf[t]
-                next_values = next_value
-            else:
-                next_nonterminal = 1.0 - done_buf[t + 1]
-                next_values = value_buf[t + 1]
+            # done_buf[t] is the outcome of the step taken at t, so it gates the
+            # bootstrap from t+1 (the old code used done_buf[t+1], off by one).
+            next_nonterminal = 1.0 - done_buf[t]
+            next_values = next_value if t == args.steps - 1 else value_buf[t + 1]
 
             delta = reward_buf[t] + gamma * next_values * next_nonterminal - value_buf[t]
             last_gae = delta + gamma * gae_lambda * next_nonterminal * last_gae
@@ -153,7 +146,7 @@ def main():
 
         returns = advantages + value_buf
 
-        b_obs = obs_buf.reshape(-1, 14)
+        b_obs = obs_buf.reshape(-1, obs_dim)
         b_actions_raw = action_raw_buf.reshape(-1, 4)
         b_old_logprob = logprob_buf.reshape(-1)
         b_advantages = advantages.reshape(-1)
@@ -203,10 +196,13 @@ def main():
                 optimizer.step()
 
         mean_reward = reward_buf.mean().item()
+        n_eps = torch.stack(ep_done_buf).sum().item()
+        avg_ep_len = args.steps * args.num_envs / max(n_eps, 1.0)
 
         print(
             f"iter={it:04d} "
             f"reward={mean_reward:.4f} "
+            f"ep_len~{avg_ep_len:.0f} "
             f"log_std={log_std.mean().item():.3f}"
         )
 
@@ -219,6 +215,10 @@ def main():
                     "critic": critic.state_dict(),
                     "log_std": log_std.detach().cpu(),
                     "best_reward": best_reward,
+                    "obs_dim": obs_dim,
+                    "hover_motor": hover_motor,
+                    "residual_scale": residual_scale,
+                    "airframe": args.airframe,
                 },
                 args.save_path,
             )

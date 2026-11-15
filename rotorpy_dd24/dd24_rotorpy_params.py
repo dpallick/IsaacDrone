@@ -31,21 +31,19 @@ rotor_speed_max = 3000.0  # rad/s [EST]
 # Replace by fitting thrust-stand data: k_eta = thrust / omega^2.
 k_eta = DD24.max_thrust_per_motor_N / (rotor_speed_max ** 2)  # [EST]
 
-# k_m (yaw moment coeff): use the Crazyflie k_m/k_eta ratio (~0.034) as a
-# placeholder. [EST] identify from yaw-step logs.
-k_m = 0.034 * k_eta  # [EST]
+# k_m (yaw moment coeff) = yaw_coeff (m) * k_eta.
+k_m = DD24.yaw_coeff * k_eta  # [EST] shared with the Isaac env
 
 quad_params = {
     # Inertial properties
     'mass': DD24.mass_kg,          # [SRC] user-measured 0.80 kg
-    # [TODO(measure)] Inertia — from CAD or a bifilar-pendulum test.
-    # Estimates for a ~0.8 kg, ~0.18 m quad:
-    'Ixx': 4.0e-3,                 # [EST]
-    'Iyy': 4.0e-3,                 # [EST]
-    'Izz': 7.0e-3,                 # [EST]
-    'Ixy': 0.0,
-    'Iyz': 0.0,
-    'Ixz': 0.0,
+    # Inertia: single source of truth in environments/dd24_params.py
+    'Ixx': DD24.Ixx,
+    'Iyy': DD24.Iyy,
+    'Izz': DD24.Izz,
+    'Ixy': DD24.Ixy,
+    'Iyz': DD24.Iyz,
+    'Ixz': DD24.Ixz,
 
     # Geometric properties (X config, vectors relative to center of mass)
     'num_rotors': 4,

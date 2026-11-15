@@ -47,9 +47,21 @@ class DD24Params:
     battery_cells: int = 4               # [SRC] 4S
     battery_nominal_V: float = 14.8      # [SRC]
 
-    # Yaw torque coefficient (reaction torque per unit thrust). [TODO] identify
-    # from logs or a bench test; carried over from the reference repo for now.
-    yaw_coeff: float = 1e-5              # [EST]
+    # Yaw torque coefficient = rotor reaction torque per newton of thrust (k_m/k_eta,
+    # units of metres). The old 1e-5 (copied from the Crazyflie env) is ~1000x too
+    # small for a 5" prop and left the policy with essentially no yaw authority.
+    # Typical 5" props are ~0.01-0.02 m. [TODO] identify from a yaw-step test.
+    yaw_coeff: float = 0.0125            # [EST]
+
+    # --- Inertia (about the centre of gravity, body frame: x fwd, y left, z up) --
+    # [TODO] Replace with your measured / CAD values (kg*m^2). These are the old
+    # placeholders. Used by BOTH the Isaac USD (via assets/dd24) and RotorPy.
+    Ixx: float = 4.0e-3                  # [EST]
+    Iyy: float = 4.0e-3                  # [EST]
+    Izz: float = 7.0e-3                  # [EST]
+    Ixy: float = 0.0
+    Ixz: float = 0.0
+    Iyz: float = 0.0
 
     # --- Flight controller ----------------------------------------------
     fc_board: str = "mamba-f405-mk2"     # [SRC] PX4 target

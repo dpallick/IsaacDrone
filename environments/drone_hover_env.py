@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import math
+
 import torch
-import numpy as np
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation
@@ -13,7 +14,6 @@ from isaaclab.utils import configclass
 from isaaclab_assets import CRAZYFLIE_CFG
 from isaaclab.sensors.imu import Imu, ImuCfg
 
-import math
 from pxr import UsdGeom
 
 from .dd24_params import DD24
@@ -24,7 +24,9 @@ class DroneHoverEnvCfg(DirectRLEnvCfg):
     episode_length_s = 20.0
     decimation = 2
     action_space = 4
-    observation_space = 14
+    # [imu_acc(3), z_err(1), quat(4), lin_vel(3), ang_vel(3), xy_err(2)]
+    # xy_err is appended LAST so obs[:, 0:14] keeps the old layout (PID still works).
+    observation_space = 16
     state_space = 0
     sim: SimulationCfg = SimulationCfg(
         dt=1 / 100,
@@ -44,227 +46,279 @@ class DroneHoverEnvCfg(DirectRLEnvCfg):
     robot = CRAZYFLIE_CFG.replace(
         prim_path="/World/envs/env_.*/Drone"
     )
+    imu: ImuCfg = ImuCfg(prim_path="/World/envs/env_.*/Drone/body")
+
     hover_height = 1.0
     crash_height = 0.1
+    # Perpendicular lever arm used by the mixer below (NOT center-to-motor for an
+    # X frame: lever = center_to_motor / sqrt(2)).
     arm_length = 0.046
     max_thrust_to_weight = 2.2
     yaw_coeff = 0.00001
     max_prop_visual_speed = 50000.0
+    # Prop prims to spin for visuals. Missing prims just disable the effect.
+    prop_visual_paths = (
+        "m1_prop/ccw_prop",
+        "m2_prop/cw_prop",
+        "m3_prop/ccw_prop",
+        "m4_prop/cw_prop",
+    )
+
+    # ---- Flight arena (the safety net) --------------------------------------
+    # The net is modelled as a GEOFENCE, not as a physical/cloth object:
+    #   * get within `net_margin` of any net face -> episode terminates + penalty
+    #   * within `net_warn_band` of the margin   -> smooth shaping penalty
+    # The arena is centred on each env origin. [TODO] measure the INSIDE of the net.
+    arena_size_xy = (3.0, 3.0)   # inner length x width of the net (m)
+    arena_height = 2.5           # height of the net ceiling (m); set <=0 if no ceiling
+    net_margin = 0.30            # hard keep-out band inside the net (m); >= drone radius + slack
+    net_warn_band = 0.30         # soft-penalty band just inside the hard margin (m)
+    max_tilt_rad = 1.2           # terminate if tilted beyond this (~70 deg)
+
+    # Spawn distribution (relative to env origin). Randomised so the policy has to
+    # actively correct xy drift instead of only ever seeing a perfect start.
+    spawn_xy_range = 0.5
+    spawn_z_range = (0.3, 1.2)
+    spawn_lin_vel_range = 0.3
+    spawn_ang_vel_range = 0.5
+
+    # ---- Reward weights ------------------------------------------------------
+    # Computed in the env from ground-truth state (privileged); the policy itself
+    # only sees the observation vector.
+    rew_alive = 1.0
+    rew_z = 2.0
+    rew_xy = 1.0
+    rew_lin_vel = 0.10
+    rew_ang_vel = 0.05
+    rew_action = 0.02
+    rew_net = 2.0
+    rew_crash = 10.0
 
 
 @configclass
 class DroneHoverEnvCfgDD24(DroneHoverEnvCfg):
-    """DD24 airframe config. Overrides the Crazyflie dynamics scalars with the
-    Duckietown DD24 numbers from `dd24_params.py`.
+    """DD24 airframe config.
 
-    STILL A PARTIAL PORT — two things remain before dynamics truly match a DD24:
-      1. `robot` below still points at the Crazyflie USD mesh (there is no
-         public DD24 USD yet). Until it is swapped, the body MASS and INERTIA
-         read from PhysX are the Crazyflie's, not the DD24's. Build/convert a
-         DD24 URDF->USD (motors at arm_length, hub at measured mass) and set
-         `robot = DD24_CFG.replace(...)` here.
-      2. Several DD24 params are [EST]/[TODO] — measure them (see dd24_params).
+    `robot` points at the DD24 USD produced by assets/dd24/build_dd24_asset.py.
+    Mass and inertia come from that USD (PhysX), so they are only correct once the
+    asset has been built from YOUR measured values (see dd24_params.py).
     """
-    # Geometry + propulsion that ARE used by _pre_physics_step today:
-    arm_length = DD24.arm_length_m              # [EST] measure wheelbase/2
-    max_thrust_to_weight = DD24.thrust_to_weight  # [EST] from thrust stand
-    yaw_coeff = DD24.yaw_coeff                  # [EST] identify from logs
-    # TODO: robot = DD24_CFG.replace(prim_path="/World/envs/env_.*/Drone")
+    # Lever arm for an X frame = center-to-motor / sqrt(2).
+    arm_length = DD24.arm_length_m / math.sqrt(2.0)
+    max_thrust_to_weight = DD24.thrust_to_weight
+    yaw_coeff = DD24.yaw_coeff
+    # URDF-imported props are links named m{i}_prop; spin the link's visuals.
+    prop_visual_paths = ("m1_prop", "m2_prop", "m3_prop", "m4_prop")
+
+    def __post_init__(self):
+        super().__post_init__()
+        # Imported lazily so the Crazyflie config works before the DD24 USD exists.
+        from assets.dd24.dd24_cfg import DD24_CFG
+        self.robot = DD24_CFG.replace(prim_path="/World/envs/env_.*/Drone")
 
 
 class DroneHoverEnv(DirectRLEnv):
     cfg: DroneHoverEnvCfg
+
     def __init__(self, cfg: DroneHoverEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
 
         self.actions = torch.zeros(self.num_envs, 4, device=self.device)
-
         self.force_b = torch.zeros(self.num_envs, 1, 3, device=self.device)
         self.torque_b = torch.zeros(self.num_envs, 1, 3, device=self.device)
 
         self.body_id = self.drone.find_bodies("body")[0]
-
-        self.prop_joint_names = [
-            "m1_joint",
-            "m2_joint",
-            "m3_joint",
-            "m4_joint",
-        ]
-
         self.prop_joint_ids = [
-            self.drone.find_joints(name)[0][0]
-            for name in self.prop_joint_names
+            self.drone.find_joints(f"m{i}_joint")[0][0] for i in range(1, 5)
         ]
 
         masses = self.drone.root_physx_view.get_masses()
         self.mass = masses[0].sum().item()
         self.g = abs(self.cfg.sim.gravity[2])
         self.hover_thrust = self.mass * self.g
-
         self.max_total_thrust = self.hover_thrust * self.cfg.max_thrust_to_weight
         self.max_motor_thrust = self.max_total_thrust / 4.0
+        # Per-motor command (0..1) that exactly cancels gravity.
+        self.hover_motor = 1.0 / self.cfg.max_thrust_to_weight
 
-        print("Drone mass:", self.mass)
-        print("Hover thrust:", self.hover_thrust)
-        print("Max motor thrust:", self.max_motor_thrust)
+        self._target_local = torch.tensor(
+            [0.0, 0.0, self.cfg.hover_height], device=self.device
+        )
+        self._half_xy = torch.tensor(
+            [self.cfg.arena_size_xy[0] / 2.0, self.cfg.arena_size_xy[1] / 2.0],
+            device=self.device,
+        )
+
+        inertia = self.drone.root_physx_view.get_inertias()[0, self.body_id[0]]
+        print(f"Drone mass: {self.mass:.4f} kg  | body inertia diag: "
+              f"{inertia.view(3, 3).diagonal().tolist()}")
+        print(f"Hover thrust: {self.hover_thrust:.3f} N | max motor thrust: "
+              f"{self.max_motor_thrust:.3f} N | hover cmd: {self.hover_motor:.3f}")
         print("Joint names:", self.drone.joint_names)
-        print("Prop joint ids:", self.prop_joint_ids)
-        stage = self.sim.stage
-        self.imu_sensors = None
+        print(f"Arena (net) inner size: {self.cfg.arena_size_xy} x {self.cfg.arena_height} m, "
+              f"margin {self.cfg.net_margin} m")
+        self._prop_xforms = None
 
-
-
+    # ------------------------------------------------------------------ scene
     def _setup_scene(self):
         self.drone = Articulation(self.cfg.robot)
         self.scene.articulations["drone"] = self.drone
+
+        # One IMU sensor over all envs, registered with the scene so it is
+        # actually updated every step (the old per-env sensors never were, so
+        # the accel obs was always zero).
+        self.imu = Imu(self.cfg.imu)
+        self.scene.sensors["imu"] = self.imu
 
         self.cfg.terrain.num_envs = self.scene.cfg.num_envs
         self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
         self.terrain = self.cfg.terrain.class_type(self.cfg.terrain)
 
         self.scene.clone_environments(copy_from_source=False)
+        # Drones in different envs must not collide with each other.
+        self.scene.filter_collisions(global_prim_paths=[self.cfg.terrain.prim_path])
 
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0)
         light_cfg.func("/World/Light", light_cfg)
-    
-        self._setup_imu_sensors()
-    
-    def _setup_imu_sensors(self):
-        self.imu_sensors = []
-        for i in range(self.scene.cfg.num_envs):
-            imu_cfg = ImuCfg(
-                prim_path=f"/World/envs/env_{i}/Drone/body",
-            )
-            imu = Imu(cfg=imu_cfg)
-            self.imu_sensors.append(imu)
-        print(f"Created {len(self.imu_sensors)} IMU sensors")
 
+    # ---------------------------------------------------------------- actions
     def _pre_physics_step(self, actions: torch.Tensor):
         self.actions = torch.clamp(actions.clone(), 0.0, 1.0)
-
-        f1 = self.actions[:, 0] * self.max_motor_thrust
-        f2 = self.actions[:, 1] * self.max_motor_thrust
-        f3 = self.actions[:, 2] * self.max_motor_thrust
-        f4 = self.actions[:, 3] * self.max_motor_thrust
-
-        total_thrust = f1 + f2 + f3 + f4
-
-        tau_x = self.cfg.arm_length * ((f3 + f4) - (f1 + f2))
-        tau_y = self.cfg.arm_length * ((f2 + f3) - (f1 + f4))
-        tau_z = self.cfg.yaw_coeff * ((f1 + f3) - (f2 + f4))
+        f = self.actions * self.max_motor_thrust
+        f1, f2, f3, f4 = f[:, 0], f[:, 1], f[:, 2], f[:, 3]
 
         self.force_b.zero_()
         self.torque_b.zero_()
-
-        self.force_b[:, 0, 2] = total_thrust
-        self.torque_b[:, 0, 0] = tau_x
-        self.torque_b[:, 0, 1] = tau_y
-        self.torque_b[:, 0, 2] = tau_z
+        self.force_b[:, 0, 2] = f.sum(dim=-1)
+        self.torque_b[:, 0, 0] = self.cfg.arm_length * ((f3 + f4) - (f1 + f2))
+        self.torque_b[:, 0, 1] = self.cfg.arm_length * ((f2 + f3) - (f1 + f4))
+        self.torque_b[:, 0, 2] = self.cfg.yaw_coeff * ((f1 + f3) - (f2 + f4))
 
     def _apply_action(self):
         self.drone.set_external_force_and_torque(
-            self.force_b,
-            self.torque_b,
-            body_ids=self.body_id,
+            self.force_b, self.torque_b, body_ids=self.body_id
         )
+        if self.sim.has_gui():
+            self._spin_props_visual()
 
-        if not hasattr(self, "prop_xforms"):
+    def _spin_props_visual(self):
+        if self._prop_xforms is None:
             stage = self.sim.stage
-
-            prop_paths = [
-                "/World/envs/env_0/Drone/m1_prop/ccw_prop",
-                "/World/envs/env_0/Drone/m2_prop/cw_prop",
-                "/World/envs/env_0/Drone/m3_prop/ccw_prop",
-                "/World/envs/env_0/Drone/m4_prop/cw_prop",
-            ]
-
-            self.prop_angles = [0.0, 0.0, 0.0, 0.0]
-            self.prop_xforms = []
-
-            for path in prop_paths:
-                prim = stage.GetPrimAtPath(path)
-
+            self._prop_xforms = []
+            for rel in self.cfg.prop_visual_paths:
+                prim = stage.GetPrimAtPath(f"/World/envs/env_0/Drone/{rel}")
                 if not prim.IsValid():
-                    print("BAD PROP PATH:", path)
-
-                xform = UsdGeom.XformCommonAPI(prim)
-                self.prop_xforms.append(xform)
-
-        for i in range(4):
+                    print(f"[viz] prop prim not found ({rel}); prop spin disabled")
+                    self._prop_xforms = []
+                    break
+                self._prop_xforms.append(UsdGeom.XformCommonAPI(prim))
+            self._prop_angles = [0.0] * len(self._prop_xforms)
+        for i, xform in enumerate(self._prop_xforms):
             if self.actions[0, i] > 0.05:
-                speed = self.cfg.max_prop_visual_speed
-
-                if i in [1, 3]:
-                    speed *= -1.0
-
-                self.prop_angles[i] += speed * self.cfg.sim.dt
-
-            self.prop_xforms[i].SetRotate(
-                (0.0, 0.0, math.degrees(self.prop_angles[i])),
+                speed = self.cfg.max_prop_visual_speed * (-1.0 if i in (1, 3) else 1.0)
+                self._prop_angles[i] += speed * self.cfg.sim.dt
+            xform.SetRotate(
+                (0.0, 0.0, math.degrees(self._prop_angles[i])),
                 UsdGeom.XformCommonAPI.RotationOrderXYZ,
             )
+
+    # ---------------------------------------------------------------- helpers
+    def _local_pos(self) -> torch.Tensor:
+        """Position relative to this env's arena centre (env origin)."""
+        return self.drone.data.root_pos_w - self.scene.env_origins
+
+    def _dist_to_net(self, pos_local: torch.Tensor) -> torch.Tensor:
+        """Distance from the drone to the nearest net face (walls, and ceiling if any)."""
+        d_xy = self._half_xy - pos_local[:, 0:2].abs()          # (N, 2)
+        d = d_xy.min(dim=-1).values
+        if self.cfg.arena_height > 0:
+            d = torch.minimum(d, self.cfg.arena_height - pos_local[:, 2])
+        return d
+
+    # ------------------------------------------------------------ observations
     def _get_observations(self):
-        root_state = self.drone.data.root_state_w
-
-        pos_w = root_state[:, 0:3]
-        quat_w = root_state[:, 3:7]
-        lin_vel_w = root_state[:, 7:10]
-        ang_vel_w = root_state[:, 10:13]
-        
-        lin_acc_b = torch.zeros(self.num_envs, 3, device=self.device)
-        if self.imu_sensors is not None:
-            for i, imu in enumerate(self.imu_sensors):
-                try:
-                    if imu.data.lin_acc_b is not None:
-                        lin_acc_b[i] = imu.data.lin_acc_b[i]
-                except Exception as e:
-                    pass
-
-        z_error = self.cfg.hover_height - pos_w[:, 2:3]
+        pos = self._local_pos()
+        data = self.drone.data
+        lin_acc_b = self.imu.data.lin_acc_b  # includes gravity, like a real IMU
+        z_error = self.cfg.hover_height - pos[:, 2:3]
+        xy_error = -pos[:, 0:2]               # target (0,0) minus position
 
         obs = torch.cat(
             [
                 lin_acc_b,
                 z_error,
-                quat_w,
-                lin_vel_w,
-                ang_vel_w,
+                data.root_quat_w,
+                data.root_lin_vel_w,
+                data.root_ang_vel_w,
+                xy_error,
             ],
             dim=-1,
         )
-
         return {"policy": obs}
 
+    # ----------------------------------------------------------------- reward
     def _get_rewards(self):
-        z = self.drone.data.root_state_w[:, 2]
-        z_error = torch.abs(self.cfg.hover_height - z)
-        return -z_error
+        pos = self._local_pos()
+        data = self.drone.data
+        err = pos - self._target_local
 
+        # Soft "don't go near the net" term: 0 far away, ramps to 1 at the hard margin.
+        dist = self._dist_to_net(pos)
+        net_pen = torch.clamp(
+            (self.cfg.net_margin + self.cfg.net_warn_band - dist) / self.cfg.net_warn_band,
+            0.0,
+            1.0,
+        ) ** 2
+
+        reward = (
+            self.cfg.rew_alive
+            - self.cfg.rew_z * err[:, 2].abs()
+            - self.cfg.rew_xy * torch.linalg.norm(err[:, 0:2], dim=-1)
+            - self.cfg.rew_lin_vel * torch.linalg.norm(data.root_lin_vel_w, dim=-1)
+            - self.cfg.rew_ang_vel * torch.linalg.norm(data.root_ang_vel_b, dim=-1)
+            - self.cfg.rew_action * torch.linalg.norm(self.actions - self.hover_motor, dim=-1)
+            - self.cfg.rew_net * net_pen
+            # reset_terminated is filled by _get_dones(), which DirectRLEnv calls first.
+            - self.cfg.rew_crash * self.reset_terminated.float()
+        )
+        return reward
+
+    # ------------------------------------------------------------------ dones
     def _get_dones(self):
-        z = self.drone.data.root_state_w[:, 2]
-
-        crashed = z < self.cfg.crash_height
+        pos = self._local_pos()
+        crashed = pos[:, 2] < self.cfg.crash_height
+        hit_net = self._dist_to_net(pos) < self.cfg.net_margin
+        # projected_gravity_b z is -1 when level, +1 upside down.
+        tilt = torch.acos(torch.clamp(-self.drone.data.projected_gravity_b[:, 2], -1.0, 1.0))
+        flipped = tilt > self.cfg.max_tilt_rad
         timed_out = self.episode_length_buf >= self.max_episode_length - 1
+        return crashed | hit_net | flipped, timed_out
 
-        return crashed, timed_out
-
+    # ------------------------------------------------------------------ reset
     def _reset_idx(self, env_ids: torch.Tensor | None):
         if env_ids is None:
             env_ids = self.drone._ALL_INDICES
-
         super()._reset_idx(env_ids)
 
+        n = len(env_ids)
+        dev = self.device
         root_state = self.drone.data.default_root_state[env_ids].clone()
-        root_state[:, 0:3] += self.scene.env_origins[env_ids]
 
-        root_state[:, 0] = 0.0
-        root_state[:, 1] = 0.0
-        root_state[:, 2] = 0.5
+        def u(lo, hi, *shape):
+            return torch.empty(*shape, device=dev).uniform_(lo, hi)
 
-        root_state[:, 7:13] = 0.0
+        r = self.cfg.spawn_xy_range
+        local = torch.stack(
+            [u(-r, r, n), u(-r, r, n), u(*self.cfg.spawn_z_range, n)], dim=-1
+        )
+        # Spawn relative to each env's own origin (previously every drone was
+        # placed at world (0, 0, 0.5), i.e. all stacked on top of each other).
+        root_state[:, 0:3] = self.scene.env_origins[env_ids] + local
+        root_state[:, 3:7] = torch.tensor([1.0, 0.0, 0.0, 0.0], device=dev)
+        root_state[:, 7:10] = u(-self.cfg.spawn_lin_vel_range, self.cfg.spawn_lin_vel_range, n, 3)
+        root_state[:, 10:13] = u(-self.cfg.spawn_ang_vel_range, self.cfg.spawn_ang_vel_range, n, 3)
 
         self.drone.write_root_pose_to_sim(root_state[:, 0:7], env_ids)
         self.drone.write_root_velocity_to_sim(root_state[:, 7:13], env_ids)
-        if hasattr(self, "prop_joint_pos"):
-            self.prop_joint_pos[env_ids] = 0.0
         self.drone.reset(env_ids)
+        self.actions[env_ids] = self.hover_motor if hasattr(self, "hover_motor") else 0.0
