@@ -1,5 +1,9 @@
 import argparse
+import csv
 import os
+import random
+import shutil
+import time
 
 from isaaclab.app import AppLauncher
 
@@ -9,7 +13,17 @@ parser.add_argument("--iters", type=int, default=2000)
 parser.add_argument("--steps", type=int, default=128)
 parser.add_argument("--epochs", type=int, default=4)
 parser.add_argument("--minibatch_size", type=int, default=1024)
-parser.add_argument("--save_path", type=str, default="checkpoints/rl_hover.pt")
+parser.add_argument("--save_path", type=str, default=None,
+                    help="Optional extra copy of the best checkpoint (old behaviour).")
+parser.add_argument("--run_dir", type=str, default="runs/hover",
+                    help="Folder for best.pt, latest.pt, progress.csv, DONE marker.")
+parser.add_argument("--resume", action="store_true",
+                    help="Continue from <run_dir>/latest.pt if it exists.")
+parser.add_argument("--save_every", type=int, default=25, help="Write latest.pt every N iters.")
+parser.add_argument("--time_limit_min", type=float, default=0.0,
+                    help="Stop cleanly (saving latest.pt) after this many minutes; 0 = no limit.")
+parser.add_argument("--seed", type=int, default=0)
+parser.add_argument("--lr", type=float, default=3e-4)
 parser.add_argument("--airframe", choices=["crazyflie", "dd24"], default="crazyflie")
 parser.add_argument("--residual_frac", type=float, default=0.33,
                     help="Policy thrust authority around hover, as a fraction of the hover command.")
@@ -44,8 +58,14 @@ class Critic(nn.Module):
 
 
 def main():
+    t_start = time.time()
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    os.makedirs(args.run_dir, exist_ok=True)
+
     env_cfg = DroneHoverEnvCfgDD24() if args.airframe == "dd24" else DroneHoverEnvCfg()
     env_cfg.scene.num_envs = args.num_envs
+    env_cfg.seed = args.seed
     env_cfg.hover_height = 1.0
 
     env = DroneHoverEnv(cfg=env_cfg, render_mode=None)
@@ -59,7 +79,7 @@ def main():
 
     optimizer = optim.Adam(
         list(actor.parameters()) + list(critic.parameters()) + [log_std],
-        lr=3e-4,
+        lr=args.lr,
     )
 
     gamma = 0.99
@@ -74,10 +94,55 @@ def main():
     residual_scale = 2.0 * args.residual_frac * hover_motor
     print(f"hover_motor={hover_motor:.3f} residual_scale={residual_scale:.3f}")
 
-    obs, _ = env.reset()
-    best_reward = -1e9
+    def checkpoint(it, best_reward):
+        return {
+            "actor": actor.state_dict(),
+            "critic": critic.state_dict(),
+            "log_std": log_std.detach().cpu(),
+            "optimizer": optimizer.state_dict(),
+            "iter": it,
+            "best_reward": best_reward,
+            "obs_dim": obs_dim,
+            "hover_motor": hover_motor,
+            "residual_scale": residual_scale,
+            "airframe": args.airframe,
+            "seed": args.seed,
+        }
 
-    for it in range(args.iters):
+    def save_atomic(obj, path):
+        tmp = path + ".tmp"
+        torch.save(obj, tmp)
+        os.replace(tmp, path)   # never leaves a half-written checkpoint if the job is killed
+
+    latest_path = os.path.join(args.run_dir, "latest.pt")
+    best_path = os.path.join(args.run_dir, "best.pt")
+    csv_path = os.path.join(args.run_dir, "progress.csv")
+    done_path = os.path.join(args.run_dir, "DONE")
+
+    start_it = 0
+    best_reward = -1e9
+    if args.resume and os.path.isfile(latest_path):
+        ck = torch.load(latest_path, map_location=device)
+        actor.load_state_dict(ck["actor"])
+        critic.load_state_dict(ck["critic"])
+        with torch.no_grad():
+            log_std.copy_(ck["log_std"].to(device))
+        optimizer.load_state_dict(ck["optimizer"])
+        start_it = ck["iter"] + 1
+        best_reward = ck["best_reward"]
+        print(f"Resumed from {latest_path} at iter {start_it} (best reward {best_reward:.4f})")
+
+    new_csv = not os.path.isfile(csv_path) or start_it == 0
+    csv_file = open(csv_path, "w" if new_csv else "a", newline="")
+    writer = csv.writer(csv_file)
+    if new_csv:
+        writer.writerow(["iter", "reward", "ep_len", "log_std", "crash_frac", "net_frac", "minutes"])
+
+    obs, _ = env.reset()
+    it = start_it - 1
+    stopped_early = False
+
+    for it in range(start_it, args.iters):
         obs_buf = []
         action_raw_buf = []
         logprob_buf = []
@@ -85,6 +150,8 @@ def main():
         done_buf = []
         value_buf = []
         ep_done_buf = []
+        n_crash = torch.zeros((), device=device)
+        n_net = torch.zeros((), device=device)
 
         for _ in range(args.steps):
             policy_obs = obs["policy"]
@@ -120,6 +187,8 @@ def main():
             # (The old global env.reset() here restarted ALL envs whenever ANY
             # one crashed, so episodes almost never got long.)
             ep_done_buf.append(done.float())
+            n_crash += (env.term_crashed | env.term_flipped).float().sum()
+            n_net += env.term_net.float().sum()
 
         with torch.no_grad():
             next_value = critic(obs["policy"])
@@ -199,31 +268,44 @@ def main():
         n_eps = torch.stack(ep_done_buf).sum().item()
         avg_ep_len = args.steps * args.num_envs / max(n_eps, 1.0)
 
+        minutes = (time.time() - t_start) / 60.0
+        crash_frac = n_crash.item() / max(n_eps, 1.0)
+        net_frac = n_net.item() / max(n_eps, 1.0)
+
         print(
             f"iter={it:04d} "
             f"reward={mean_reward:.4f} "
             f"ep_len~{avg_ep_len:.0f} "
-            f"log_std={log_std.mean().item():.3f}"
+            f"crash={crash_frac:.2f} net={net_frac:.2f} "
+            f"log_std={log_std.mean().item():.3f} "
+            f"t={minutes:.1f}min",
+            flush=True,
         )
+        writer.writerow([it, f"{mean_reward:.5f}", f"{avg_ep_len:.1f}",
+                         f"{log_std.mean().item():.4f}", f"{crash_frac:.4f}",
+                         f"{net_frac:.4f}", f"{minutes:.2f}"])
+        csv_file.flush()
 
         if mean_reward > best_reward:
             best_reward = mean_reward
-            os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
-            torch.save(
-                {
-                    "actor": actor.state_dict(),
-                    "critic": critic.state_dict(),
-                    "log_std": log_std.detach().cpu(),
-                    "best_reward": best_reward,
-                    "obs_dim": obs_dim,
-                    "hover_motor": hover_motor,
-                    "residual_scale": residual_scale,
-                    "airframe": args.airframe,
-                },
-                args.save_path,
-            )
-            print(f"saved best reward {best_reward:.4f}")
+            save_atomic(checkpoint(it, best_reward), best_path)
+            if args.save_path:
+                os.makedirs(os.path.dirname(args.save_path) or ".", exist_ok=True)
+                shutil.copy(best_path, args.save_path)
 
+        if (it + 1) % args.save_every == 0:
+            save_atomic(checkpoint(it, best_reward), latest_path)
+
+        if args.time_limit_min > 0 and minutes >= args.time_limit_min:
+            print(f"Time limit reached ({minutes:.1f} min) - saving and stopping at iter {it}.")
+            stopped_early = True
+            break
+
+    save_atomic(checkpoint(it, best_reward), latest_path)
+    csv_file.close()
+    if not stopped_early:
+        open(done_path, "w").write(f"finished {args.iters} iters, best reward {best_reward:.4f}\n")
+        print(f"Training complete -> {best_path}")
     env.close()
 
 

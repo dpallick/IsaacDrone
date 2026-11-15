@@ -77,7 +77,12 @@ quad_params = {
 
     # Lower-level controller gains used by cmd_vel/cmd_ctbr/cmd_ctatt.
     # [EST] carried from Crazyflie — WILL likely need retuning for 0.8 kg.
-    'k_w': 200,
+    # Body-rate P gain for cmd_ctbr (commanded moment = I * k_w * rate_error).
+    # The Crazyflie's 200 is unstable with the DD24's tau_m: a 2 rad/s step
+    # overshoots ~90% and the motors saturate, adding thrust (the drone climbs).
+    # 15 gives ~20% overshoot, ~140 ms rise with tau_m=0.072. Retune if tau_m changes
+    # (a step-test sweep is in the Oscar README), or match PX4's MC_ROLLRATE_P.
+    'k_w': 15,
     'k_v': 10,
     'kp_att': 310,
     'kd_att': 57.0,

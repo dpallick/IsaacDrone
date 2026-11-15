@@ -67,8 +67,71 @@ Checkpoints are saved to `checkpoints/<airframe>_hover_<jobid>.pt`. To pull one 
 scp YOURID@ssh.ccv.brown.edu:~/IsaacDrone/checkpoints/dd24_hover_*.pt ./checkpoints/
 ```
 
+## 4. Overnight runs (train -> test, resumable)
+
+### One-time: the Python venv (for RotorPy + analysis)
+```bash
+bash oscar/setup_venv.sh          # on a login node; creates ~/envs/dd24
+```
+Isaac Sim can't live in a venv on Oscar. Its pip wheels need GLIBC >= 2.35, newer
+than Oscar's OS. So Isaac runs from the Apptainer image, and the venv is for RotorPy
+(CPU) and for looking at results.
+
+### Submit everything before you leave
+```bash
+cd ~/IsaacDrone && git pull
+bash oscar/overnight.sh                               # Isaac x3 seeds + RotorPy x3 seeds
+MAIL_USER=you@brown.edu bash oscar/overnight.sh       # same, plus an email per job
+```
+Each job **trains, then tests itself**:
+
+| | Isaac (GPU, `gpu` partition) | RotorPy (CPU, `batch` partition) |
+|---|---|---|
+| train | `train_rl_hover.py` -> `runs/<tag>_s<seed>/best.pt, latest.pt, progress.csv` | `train_paths.py` -> `latest.zip`, `ckpts/` |
+| test  | `eval_rl_hover.py`: 512 fresh episodes, no exploration noise | `eval_policy.py`: 256 fresh episodes |
+| result | `eval.json` | `eval.json` |
+
+Both stop cleanly before the 10 h walltime. If training isn't finished, the job
+**resubmits itself** (up to 2 times) and resumes from `latest.pt`/`latest.zip`.
+Nothing is lost if Oscar kills a job: checkpoints are written atomically.
+
+### In the morning
+```bash
+python3 oscar/summarize_runs.py          # table of every run: progress + test results
+squeue -u $USER                          # anything still running / resubmitted
+tail -n 30 oscar/logs/isaac_hover_*_0.out
+```
+`PASS` in the summary means the test met all of: 95%+ of episodes completed,
+mean horizontal error under 15 cm, and (Isaac) mean height error under 10 cm.
+These thresholds live in the eval scripts.
+
+### Useful knobs (environment variables)
+```bash
+SEEDS=0-4 bash oscar/overnight.sh                     # more seeds
+ONLY=rotorpy bash oscar/overnight.sh                  # one track only
+ITERS=6000 NUM_ENVS=2048 sbatch --array=0-2 oscar/train_eval_isaac.sbatch
+TASK=takeoff TIMESTEPS=40000000 sbatch --array=0-2 oscar/train_eval_rotorpy.sbatch
+SEED=0 RUN_TAG=dd24_hover_1114 sbatch oscar/train_eval_isaac.sbatch   # resume one run
+```
+If you change `#SBATCH --time`, set `WALL_MIN` to match (minutes) so the job
+stops in time to save and test.
+
+### Testing a checkpoint by hand
+```bash
+# Isaac (inside the container, from a GPU node or a job)
+source oscar/common.sh
+isaac_exec "cd ~/IsaacDrone && $ISAACLAB_DIR/isaaclab.sh -p eval_rl_hover.py --headless \
+    --checkpoint runs/dd24_hover_1114_s0/best.pt"
+# RotorPy (venv, any node)
+source ~/envs/dd24/bin/activate
+python rotorpy_dd24/eval_policy.py --model runs/rotorpy_hover_1114_s0/latest.zip --net
+python rotorpy_dd24/visualize_policy.py --model runs/rotorpy_hover_1114_s0/latest.zip   # plot
+```
+
 ## Recommended first run
-Start with a 30-minute `AIRFRAME=crazyflie ITERS=200` job. It checks the container,
+Before the first overnight batch, run a short Isaac smoke test:
+`ITERS=30 WALL_MIN=40 RESUBMITS=0 sbatch --time=00:40:00 oscar/train_eval_isaac.sbatch`.
+It should finish with an `eval.json` in `runs/dd24_hover_s0/`. Or start with a 30-minute `AIRFRAME=crazyflie ITERS=200` job. It checks the container,
 the Isaac Lab install, and Nucleus asset access (the Crazyflie mesh and ground
 plane download on first run) before you spend an 8-hour allocation.
 

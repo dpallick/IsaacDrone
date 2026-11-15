@@ -17,6 +17,7 @@ from isaaclab.sensors.imu import Imu, ImuCfg
 from pxr import UsdGeom
 
 from .dd24_params import DD24
+from . import arena as A
 
 
 @configclass
@@ -49,7 +50,7 @@ class DroneHoverEnvCfg(DirectRLEnvCfg):
     imu: ImuCfg = ImuCfg(prim_path="/World/envs/env_.*/Drone/body")
 
     hover_height = 1.0
-    crash_height = 0.1
+    crash_height = A.CRASH_HEIGHT
     # Perpendicular lever arm used by the mixer below (NOT center-to-motor for an
     # X frame: lever = center_to_motor / sqrt(2)).
     arm_length = 0.046
@@ -69,10 +70,10 @@ class DroneHoverEnvCfg(DirectRLEnvCfg):
     #   * get within `net_margin` of any net face -> episode terminates + penalty
     #   * within `net_warn_band` of the margin   -> smooth shaping penalty
     # The arena is centred on each env origin. [TODO] measure the INSIDE of the net.
-    arena_size_xy = (3.0, 3.0)   # inner length x width of the net (m)
-    arena_height = 2.5           # height of the net ceiling (m); set <=0 if no ceiling
-    net_margin = 0.30            # hard keep-out band inside the net (m); >= drone radius + slack
-    net_warn_band = 0.30         # soft-penalty band just inside the hard margin (m)
+    arena_size_xy = A.ARENA_SIZE_XY   # set in environments/arena.py (shared with RotorPy)
+    arena_height = A.ARENA_HEIGHT
+    net_margin = A.NET_MARGIN
+    net_warn_band = A.NET_WARN_BAND
     max_tilt_rad = 1.2           # terminate if tilted beyond this (~70 deg)
 
     # Spawn distribution (relative to env origin). Randomised so the policy has to
@@ -292,6 +293,8 @@ class DroneHoverEnv(DirectRLEnv):
         tilt = torch.acos(torch.clamp(-self.drone.data.projected_gravity_b[:, 2], -1.0, 1.0))
         flipped = tilt > self.cfg.max_tilt_rad
         timed_out = self.episode_length_buf >= self.max_episode_length - 1
+        # Kept for logging/evaluation (why did each episode end?).
+        self.term_crashed, self.term_net, self.term_flipped = crashed, hit_net, flipped
         return crashed | hit_net | flipped, timed_out
 
     # ------------------------------------------------------------------ reset
