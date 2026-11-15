@@ -328,5 +328,16 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
-    simulation_app.close()
+    # Isaac Sim's simulation_app.close() can hang forever in headless containers
+    # (it did on Oscar: 6+ hours after training had finished). Everything is already
+    # written to disk by now, so exit the process directly instead.
+    import os as _os, sys as _sys, traceback as _tb
+    _code = 0
+    try:
+        main()
+    except Exception:
+        _tb.print_exc()
+        _code = 1
+    _sys.stdout.flush()
+    _sys.stderr.flush()
+    _os._exit(_code)

@@ -28,7 +28,8 @@ fi
 MAIL=()
 [ -n "${MAIL_USER:-}" ] && MAIL=(--mail-type=END,FAIL --mail-user="$MAIL_USER")
 
-# Exploratory accounts get 2 GPUs at once; %2 runs at most 2 Isaac seeds together.
+# Exploratory accounts: 2 GPUs + 12 CPU cores at once across all GPU jobs.
+# %2 runs at most 2 Isaac seeds together (6 cores each); the 3rd starts when one ends.
 if [ "$ONLY" = "all" ] || [ "$ONLY" = "isaac" ]; then
     RUN_TAG="dd24_hover_${STAMP}" sbatch --array="${SEEDS}%2" "${MAIL[@]}" \
         --export=ALL,RUN_TAG="dd24_hover_${STAMP}" oscar/train_eval_isaac.sbatch

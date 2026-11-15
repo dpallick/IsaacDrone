@@ -22,6 +22,8 @@ isaac_exec() {
     mkdir -p "$ISAAC_CACHE"/{kit,kitdata,kitlogs,ov,pip,glcache,computecache,logs,data,documents} "$PYUSER"
     # Apptainer runs as YOU (not root), so Omniverse caches land under $HOME
     # inside the container. Redirect each of them to scratch.
+    # ISAAC_TIMEOUT (e.g. 30m) kills the container if it overruns; unset = no limit.
+    timeout --kill-after=60 "${ISAAC_TIMEOUT:-0}" \
     apptainer exec --nv \
         --env ACCEPT_EULA=Y \
         --env OMNI_KIT_ACCEPT_EULA=YES \
