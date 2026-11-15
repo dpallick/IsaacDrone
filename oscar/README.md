@@ -37,19 +37,20 @@ tail -f oscar/logs/isaaclab_setup_*.out # wait for "Isaac Lab OK"
 ```
 
 ## 2. Build the DD24 asset (mesh + inertia -> URDF -> USD)
-The URDF step is plain Python and can run anywhere (laptop or Oscar login node):
+`assets/dd24/dd24.urdf` and `meshes/dd24_body.obj` are already generated from the
+DD24 CAD and the bifilar inertia measurement. You only need the USD conversion
+(`sbatch oscar/convert_dd24.sbatch`). To regenerate after changing values:
 ```bash
-python assets/dd24/build_dd24_urdf.py \
-    --mesh path/to/dd24.stl --mesh-scale 0.001 \
-    --cg 0 0 0.012 \
-    --inertia IXX IYY IZZ            # kg*m^2 about the CG (optionally + IXY IXZ IYZ)
+python assets/dd24/prep_cad_mesh.py DD24.stl assets/dd24/meshes/dd24_body.obj 60000   # only if CAD changed
+python assets/dd24/build_dd24_urdf.py --mesh assets/dd24/meshes/dd24_body.obj \
+    --prop-z 0.018 --collision-box 0.272 0.272 0.107     # mass/inertia/arm from dd24_params.py
 ```
 Then convert on a GPU node:
 ```bash
 sbatch oscar/convert_dd24.sbatch        # -> assets/dd24/dd24.usd
 ```
-Also update `Ixx/Iyy/Izz` in `environments/dd24_params.py` so RotorPy uses the
-same numbers.
+Mass, arm length and inertia all come from `environments/dd24_params.py`, so
+Isaac and RotorPy always use the same numbers.
 
 ## 3. Train
 ```bash

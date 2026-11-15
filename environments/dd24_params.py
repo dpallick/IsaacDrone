@@ -24,7 +24,7 @@ class DD24Params:
     # All-up flight weight 0.82704 kg (user-measured on a scale). The 1.76 kg
     # store/manual figure is the kit/box weight, not flight mass. Scales
     # thrust-to-weight directly, so re-confirm on a scale if the build changes.
-    mass_kg: float = 0.82704  # [SRC] user-measured AUW (827.04 g)
+    mass_kg: float = 0.828    # [SRC] user-measured AUW (bifilar-pendulum sheet, 828 g)
 
     # Component masses that are known, for a bottom-up sanity check vs the scale:
     motor_mass_kg: float = 0.028        # [SRC] DX2205, ~28 g each
@@ -33,10 +33,10 @@ class DD24Params:
     n_rotors: int = 4
 
     # --- Geometry --------------------------------------------------------
-    # [TODO(measure)] Arm length = distance from the frame center to a motor
-    # shaft. Measure motor-to-motor diagonal (wheelbase) and divide by 2.
-    # 4040 props imply a ~180 mm wheelbase class, so ~0.09 m is the estimate.
-    arm_length_m: float = 0.09          # [EST]
+    # Arm length = frame centre to motor shaft. Measured from the DD24 CAD
+    # (DD24.step/.stl): motor centres at (+-80, +-80) mm -> 113.3 mm average,
+    # i.e. a ~227 mm wheelbase.
+    arm_length_m: float = 0.1133        # [SRC] CAD
 
     # --- Propulsion ------------------------------------------------------
     # [TODO(measure)] Max thrust PER MOTOR at full throttle on a 4S pack.
@@ -53,12 +53,15 @@ class DD24Params:
     # Typical 5" props are ~0.01-0.02 m. [TODO] identify from a yaw-step test.
     yaw_coeff: float = 0.0125            # [EST]
 
-    # --- Inertia (about the centre of gravity, body frame: x fwd, y left, z up) --
-    # [TODO] Replace with your measured / CAD values (kg*m^2). These are the old
-    # placeholders. Used by BOTH the Isaac USD (via assets/dd24) and RotorPy.
-    Ixx: float = 4.0e-3                  # [EST]
-    Iyy: float = 4.0e-3                  # [EST]
-    Izz: float = 7.0e-3                  # [EST]
+    # --- Inertia (body frame: x fwd, y left, z up), kg*m^2 ---------------------
+    # Bifilar-pendulum measurement (CSCI 1951R Desmos sheet): m=0.828 kg, wire
+    # half-spacing d=0.085 m, I = m g d^2 T^2 / (4 pi^2 L), T = mean of 5 runs of
+    # 5 oscillations. Run-to-run scatter gives ~1-2% uncertainty on each value.
+    #   roll  L=0.29 m, T=0.837 s    pitch L=0.30 m, T=0.887 s    yaw L=0.36 m, T=1.216 s
+    # Used by BOTH the Isaac USD (via assets/dd24) and RotorPy.
+    Ixx: float = 3.593e-3                # [SRC] measured
+    Iyy: float = 3.900e-3                # [SRC] measured
+    Izz: float = 6.106e-3                # [SRC] measured
     Ixy: float = 0.0
     Ixz: float = 0.0
     Iyz: float = 0.0
@@ -95,8 +98,9 @@ DD24 = DD24Params()
 if __name__ == "__main__":
     p = DD24
     print(f"mass (AUW):            {p.mass_kg:.3f} kg   [user-measured]")
+    print(f"inertia Ixx Iyy Izz:   {p.Ixx:.3e} {p.Iyy:.3e} {p.Izz:.3e} kg m^2  [bifilar]")
     print(f"component lower bound: {p.component_mass_lower_bound_kg():.3f} kg")
-    print(f"arm length:            {p.arm_length_m:.3f} m   [EST - MEASURE THIS]")
+    print(f"arm length:            {p.arm_length_m:.4f} m   [from CAD]")
     print(f"max thrust/motor:      {p.max_thrust_per_motor_N:.2f} N   [EST - MEASURE THIS]")
     print(f"max total thrust:      {p.max_total_thrust_N:.2f} N")
     print(f"thrust-to-weight:      {p.thrust_to_weight:.2f}")

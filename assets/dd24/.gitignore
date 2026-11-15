@@ -1,5 +1,4 @@
-# Built artifacts (regenerate with build_dd24_urdf.py / convert_to_usd.sh)
+# Built artifacts
 *.usd
 *.usda
-dd24.urdf
 configuration/
