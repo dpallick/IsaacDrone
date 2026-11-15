@@ -45,6 +45,8 @@ isaac_exec "
     cd '$ISAACLAB_DIR'
     # 'none' = core Isaac Lab only (we bring our own PPO); much faster install.
     ./isaaclab.sh --install none
-    ./isaaclab.sh -p -c 'import isaaclab, isaaclab_assets, torch; print(\"Isaac Lab OK:\", isaaclab.__file__, \"| torch\", torch.__version__, \"| cuda\", torch.cuda.is_available())'
+    # isaaclab_assets needs the Kit app running (omni.client), so the check starts
+    # Isaac Sim headless rather than importing in plain python.
+    ./isaaclab.sh -p '$REPO_DIR/oscar/check_isaaclab.py'
 "
 echo "Isaac Lab installed into $PYUSER"
