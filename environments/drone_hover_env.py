@@ -134,13 +134,22 @@ class DroneHoverEnvCfg(DirectRLEnvCfg):
     # P(reading replaced by a random shorter distance).
     tof_ghost_range = (0.0, 0.03)
 
-    # ---- Optical flow (downward), as PX4 gives it: horizontal velocity in the body
-    # frame = flow rate x height, so its error scales with the DOWN ToF's error. --------
+    # ---- Optical flow: Pi camera -> Raspberry Pi (flow) -> PX4 ---------------------
+    # Horizontal velocity in the body frame = flow rate x height from the DOWN ToF,
+    # so its error scales with the ToF's error. The camera pipeline adds: a frame
+    # rate below the 50 Hz policy (last value held), latency (capture + Pi + MAVLink),
+    # a max trackable image speed, imperfect gyro de-rotation, and the camera's
+    # lever arm (it sits at the nose, so yaw/pitch rates move it sideways/vertically).
     flow_noise_std = 0.05                  # m/s
     flow_noise_per_m = 0.03                # extra m/s of noise per metre of height
     flow_scale_range = (0.90, 1.10)        # per-episode calibration (focal length) error
     flow_dropout_range = (0.0, 0.3)        # per-episode P(no valid flow): floor texture/light
     flow_height_range = (0.08, 4.0)        # m; outside this the sensor reports invalid
+    flow_cam_pos_b = (0.114, -0.004, 0.011)  # m, Pi camera position from the CAD (nose)
+    flow_rate_hz_range = (20.0, 40.0)      # per episode: Pi flow output rate
+    flow_latency_s_range = (0.03, 0.08)    # per episode: image -> PX4 delay
+    flow_max_rate = 3.0                    # rad/s image speed (|v|/h) beyond which tracking fails
+    flow_rot_residual = 0.05               # fraction of body rate left after gyro de-rotation
 
     # ---- Scenes (re-drawn every episode; see environments/scenes.py) ------------
     # "random" draws from scene_probs; or force one of scenes.SCENARIOS, e.g.
@@ -306,6 +315,15 @@ class DroneHoverEnv(DirectRLEnv):
         self._tof_ghost_p = torch.zeros(N, 1, device=self.device)
         self._flow_scale = torch.ones(N, 1, device=self.device)
         self._flow_drop_p = torch.zeros(N, 1, device=self.device)
+        # Camera pipeline state: delay line, hold value, frame clock.
+        self._flow_cam_r = torch.tensor(self.cfg.flow_cam_pos_b, device=self.device)
+        self._flow_lmax = 6
+        self._flow_buf = torch.zeros(N, self._flow_lmax, 3, device=self.device)
+        self._flow_hold = torch.zeros(N, 3, device=self.device)
+        self._flow_phase = torch.zeros(N, device=self.device)
+        self._flow_rate = torch.full((N,), 30.0, device=self.device)
+        self._flow_lat = torch.zeros(N, dtype=torch.long, device=self.device)
+        self._flow_fill = torch.ones(N, dtype=torch.bool, device=self.device)
         names = [t[0] for t in self.cfg.tof_sensors]
         self._down_idx = names.index("down") if "down" in names else None
         self._scene = empty_scenes(N, self.cfg.scene_clutter_max, self.device)
@@ -455,27 +473,47 @@ class DroneHoverEnv(DirectRLEnv):
         return meas.clamp(mn, mx), true.clamp(max=mx)
 
     def _optical_flow(self, tof_meas: torch.Tensor, tof_true: torch.Tensor) -> torch.Tensor:
-        """Downward optical flow -> body-frame horizontal velocity (N, 2) + valid flag (N, 1).
+        """Pi-camera optical flow as PX4 receives it: body-frame horizontal velocity
+        (N, 2) + valid flag (N, 1), after the camera pipeline (rate, latency).
 
-        Like PX4: velocity = flow rate x height from the DOWN ToF, so a bad height
-        reading scales the velocity wrong. Invalid (zeros, flag 0) when too low/high,
-        when the floor has too little texture/light (per-episode dropout), or when
-        the down ToF has no reading."""
+        velocity = (camera's ground velocity) x (measured / true height) x calibration
+                   + noise + leftover rotation, invalid when too low/high, too fast to
+                   track, on a poor floor (per-episode dropout) or with no down ToF.
+        The camera is at flow_cam_pos_b, so rotation moves it: v_cam = v + w x r."""
         N = tof_meas.shape[0]
         if self._down_idx is None:
             return torch.zeros(N, 3, device=self.device)
-        q = self.drone.data.root_quat_w
-        q_inv = q * torch.tensor([1.0, -1.0, -1.0, -1.0], device=self.device)
-        v_b = quat_rotate(q_inv, self.drone.data.root_lin_vel_w)[:, 0:2]
+        data = self.drone.data
+        q_inv = data.root_quat_w * torch.tensor([1.0, -1.0, -1.0, -1.0], device=self.device)
+        w_b = data.root_ang_vel_b
+        v_cam = quat_rotate(q_inv, data.root_lin_vel_w) + torch.cross(w_b, self._flow_cam_r.expand(N, 3), dim=-1)
+        v_xy = v_cam[:, 0:2]
         h_true = tof_true[:, self._down_idx:self._down_idx + 1]
         h_meas = tof_meas[:, self._down_idx:self._down_idx + 1]
         ratio = (h_meas / h_true.clamp(min=1e-3)).clamp(0.25, 4.0)
-        noise = torch.randn_like(v_b) * (self.cfg.flow_noise_std + self.cfg.flow_noise_per_m * h_true)
-        v = v_b * ratio * self._flow_scale + noise
+        # imperfect de-rotation: a pitch rate looks like x motion, a roll rate like -y motion
+        rot = self.cfg.flow_rot_residual * h_true * torch.stack([w_b[:, 1], -w_b[:, 0]], dim=-1)
+        noise = torch.randn_like(v_xy) * (self.cfg.flow_noise_std + self.cfg.flow_noise_per_m * h_true)
+        v = v_xy * ratio * self._flow_scale + rot + noise
         lo, hi = self.cfg.flow_height_range
-        valid = (h_true > lo) & (h_true < hi) & (h_meas < self.cfg.tof_max_range) \
+        trackable = (torch.linalg.norm(v_xy, dim=-1, keepdim=True) / h_true.clamp(min=1e-3)) < self.cfg.flow_max_rate
+        valid = (h_true > lo) & (h_true < hi) & (h_meas < self.cfg.tof_max_range) & trackable \
             & (torch.rand_like(h_true) >= self._flow_drop_p)
-        return torch.cat([torch.where(valid, v, torch.zeros_like(v)), valid.float()], dim=-1)
+        raw = torch.cat([torch.where(valid, v, torch.zeros_like(v)), valid.float()], dim=-1)
+
+        # ---- camera pipeline: delay line + frame clock (zero-order hold) ----
+        fill = self._flow_fill
+        if bool(fill.any()):
+            self._flow_buf[fill] = raw[fill][:, None].expand(-1, self._flow_lmax, -1)
+            self._flow_hold[fill] = raw[fill]
+            self._flow_fill[fill] = False
+        self._flow_buf = torch.cat([self._flow_buf[:, 1:], raw[:, None]], dim=1)
+        delayed = self._flow_buf[torch.arange(N, device=self.device), self._flow_lmax - 1 - self._flow_lat]
+        self._flow_phase += self._flow_rate * (self.cfg.sim.dt * self.cfg.decimation)
+        fresh = self._flow_phase >= 1.0
+        self._flow_phase = torch.where(fresh, self._flow_phase - 1.0, self._flow_phase)
+        self._flow_hold = torch.where(fresh[:, None], delayed, self._flow_hold)
+        return self._flow_hold.clone()
 
     # ------------------------------------------------------------ observations
     def _get_observations(self):
@@ -623,6 +661,12 @@ class DroneHoverEnv(DirectRLEnv):
         self._tof_ghost_p[env_ids] = u(*c.tof_ghost_range, n, 1)
         self._flow_scale[env_ids] = u(*c.flow_scale_range, n, 1)
         self._flow_drop_p[env_ids] = u(*c.flow_dropout_range, n, 1)
+        self._flow_rate[env_ids] = u(*c.flow_rate_hz_range, n)
+        step_dt = c.sim.dt * c.decimation
+        lat = torch.round(u(*c.flow_latency_s_range, n) / step_dt).long()
+        self._flow_lat[env_ids] = lat.clamp(0, self._flow_lmax - 1)
+        self._flow_phase[env_ids] = torch.rand(n, device=dev)
+        self._flow_fill[env_ids] = True
         self._tof_drop_p[env_ids] = u(*c.tof_net_dropout_range, n, 1)
         self._accel_bias[env_ids] = u(-c.accel_bias_range, c.accel_bias_range, n, 3)
         self._gyro_bias[env_ids] = u(-c.gyro_bias_range, c.gyro_bias_range, n, 3)
