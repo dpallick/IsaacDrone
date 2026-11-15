@@ -46,7 +46,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 # decide what happens next, not the exit code.
 ISAAC_TIMEOUT="$(( TRAIN_MIN + 10 ))m" isaac_exec "cd '$REPO_DIR' && '$ISAACLAB_DIR/isaaclab.sh' -p train_rl_hover.py --headless \
     --airframe $AIRFRAME --num_envs $NUM_ENVS --iters $ITERS --steps $STEPS \
-    --seed $SEED --run_dir $RUN_DIR --resume --time_limit_min $TRAIN_MIN" \
+    --seed $SEED --run_dir $RUN_DIR --resume --time_limit_min $TRAIN_MIN ${EXTRA:-}" \
     || echo "WARNING: training process exited with an error or timed out (checking DONE/latest.pt)"
 
 # ---- not finished? resubmit to continue ----------------------------------

@@ -23,7 +23,13 @@ parser.add_argument("--save_every", type=int, default=25, help="Write latest.pt 
 parser.add_argument("--time_limit_min", type=float, default=0.0,
                     help="Stop cleanly (saving latest.pt) after this many minutes; 0 = no limit.")
 parser.add_argument("--seed", type=int, default=0)
-parser.add_argument("--lr", type=float, default=3e-4)
+parser.add_argument("--lr", type=float, default=3e-4, help="Initial learning rate")
+parser.add_argument("--lr_schedule", choices=["adaptive", "linear", "constant"], default="adaptive",
+                    help="adaptive: adjust every minibatch to keep the policy step near --desired_kl "
+                         "(as rsl_rl / Isaac Lab do); linear: decay to 5%% of --lr by the last iter")
+parser.add_argument("--desired_kl", type=float, default=0.01)
+parser.add_argument("--lr_min", type=float, default=1e-5)
+parser.add_argument("--lr_max", type=float, default=1e-3)
 parser.add_argument("--scenario", default="random",
                     choices=["random", "net_only", "net_in_room", "room", "open", "fixed_net"],
                     help="Scenes to train in (random = mix of nets, rooms, open halls)")
@@ -121,6 +127,7 @@ def main():
             "obs_mode": args.obs_mode,
             "obs_history": env_cfg.obs_history,
             "scenario": args.scenario,
+            "lr_schedule": args.lr_schedule,
             "hover_motor": hover_motor,
             "residual_scale": residual_scale,
             "airframe": args.airframe,
@@ -154,7 +161,8 @@ def main():
     csv_file = open(csv_path, "w" if new_csv else "a", newline="")
     writer = csv.writer(csv_file)
     if new_csv:
-        writer.writerow(["iter", "reward", "ep_len", "log_std", "crash_frac", "net_frac", "minutes"])
+        writer.writerow(["iter", "reward", "ep_len", "log_std", "crash_frac", "net_frac", "minutes",
+                         "lr", "kl"])
 
     obs, _ = env.reset()
     it = start_it - 1
@@ -250,6 +258,12 @@ def main():
         batch_size = b_obs.shape[0]
         indices = torch.arange(batch_size, device=device)
 
+        if args.lr_schedule == "linear":
+            frac = max(1.0 - it / max(args.iters, 1), 0.05)
+            for g in optimizer.param_groups:
+                g["lr"] = args.lr * frac
+        kl_sum, kl_n = 0.0, 0
+
         for _ in range(args.epochs):
             perm = indices[torch.randperm(batch_size, device=device)]
 
@@ -263,7 +277,21 @@ def main():
                 new_logprob = dist.log_prob(b_actions_raw[mb_idx]).sum(dim=-1)
                 entropy = dist.entropy().sum(dim=-1).mean()
 
-                ratio = torch.exp(new_logprob - b_old_logprob[mb_idx])
+                log_ratio = new_logprob - b_old_logprob[mb_idx]
+                ratio = torch.exp(log_ratio)
+                with torch.no_grad():
+                    # How far this update moved the policy (low-variance KL estimate).
+                    kl = ((ratio - 1.0) - log_ratio).mean().item()
+                kl_sum += kl
+                kl_n += 1
+                if args.lr_schedule == "adaptive":
+                    lr_now = optimizer.param_groups[0]["lr"]
+                    if kl > 2.0 * args.desired_kl:
+                        lr_now = max(lr_now / 1.5, args.lr_min)
+                    elif 0.0 < kl < 0.5 * args.desired_kl:
+                        lr_now = min(lr_now * 1.5, args.lr_max)
+                    for g in optimizer.param_groups:
+                        g["lr"] = lr_now
 
                 pg_loss_1 = -b_advantages[mb_idx] * ratio
                 pg_loss_2 = -b_advantages[mb_idx] * torch.clamp(
@@ -288,6 +316,8 @@ def main():
                 optimizer.step()
 
         mean_reward = reward_buf.mean().item()
+        lr_now = optimizer.param_groups[0]["lr"]
+        mean_kl = kl_sum / max(kl_n, 1)
         n_eps = torch.stack(ep_done_buf).sum().item()
         avg_ep_len = args.steps * args.num_envs / max(n_eps, 1.0)
 
@@ -301,12 +331,13 @@ def main():
             f"ep_len~{avg_ep_len:.0f} "
             f"crash={crash_frac:.2f} net={net_frac:.2f} "
             f"log_std={log_std.mean().item():.3f} "
+            f"lr={lr_now:.1e} kl={mean_kl:.4f} "
             f"t={minutes:.1f}min",
             flush=True,
         )
         writer.writerow([it, f"{mean_reward:.5f}", f"{avg_ep_len:.1f}",
                          f"{log_std.mean().item():.4f}", f"{crash_frac:.4f}",
-                         f"{net_frac:.4f}", f"{minutes:.2f}"])
+                         f"{net_frac:.4f}", f"{minutes:.2f}", f"{lr_now:.3e}", f"{mean_kl:.5f}"])
         csv_file.flush()
 
         if mean_reward > best_reward:

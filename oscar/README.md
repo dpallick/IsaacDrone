@@ -105,6 +105,12 @@ tail -n 30 oscar/logs/isaac_hover_*_0.out
 mean horizontal error under 15 cm, and (Isaac) mean height error under 10 cm.
 These thresholds live in the eval scripts.
 
+### Learning rate
+Training uses an **adaptive** schedule by default: after every minibatch the
+learning rate is lowered if the policy just moved too far (KL > 0.02) and raised if
+it barely moved (KL < 0.005), within 1e-5..1e-3. `lr` and `kl` are printed every
+iteration and saved in `progress.csv`. To compare, pass `EXTRA="--lr_schedule linear"`.
+
 ### Useful knobs (environment variables)
 ```bash
 SEEDS=0-4 bash oscar/overnight.sh                     # more seeds
