@@ -443,7 +443,11 @@ class DroneHoverEnv(DirectRLEnv):
         self.force_b[:, 0, 2] = f.sum(dim=-1)
         self.torque_b[:, 0, 0] = self.cfg.arm_length * ((f3 + f4) - (f1 + f2))
         self.torque_b[:, 0, 1] = self.cfg.arm_length * ((f2 + f3) - (f1 + f4))
-        self.torque_b[:, 0, 2] = self.cfg.yaw_coeff * ((f1 + f3) - (f2 + f4))
+        # Yaw: m1 (front-right) and m3 (back-left) carry CCW props (PX4 quad X, your
+        # CA_ROTOR0/1_KM = +0.05). A CCW prop's drag turns the BODY clockwise seen
+        # from above, i.e. -z in FLU, so speeding up m1+m3 gives NEGATIVE yaw torque.
+        # (This was sign-flipped before; RotorPy already had it right.)
+        self.torque_b[:, 0, 2] = self.cfg.yaw_coeff * ((f2 + f4) - (f1 + f3))
 
     def ctbr_setpoint(self, cmd: torch.Tensor):
         """a in [-1,1]^4 -> (normalised collective thrust (N,1), body rates FLU (N,3)).

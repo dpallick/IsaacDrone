@@ -19,7 +19,10 @@ PX4 works in FRD internally; MAVROS converts, and a PID is symmetric under that
 sign change, so the behaviour is the same.
 
 Motor order matches the env: m1 front-right, m2 back-right, m3 back-left,
-m4 front-left (props m1/m3 spin one way, m2/m4 the other).
+m4 front-left. Props: m1/m3 CCW, m2/m4 CW (seen from above), as on the DD24.
+PX4 numbers them differently: PX4 motor 1 = m1 (FR), 2 = m3 (BL), 3 = m4 (FL),
+4 = m2 (BR). Only matters if you ever send per-motor commands; with
+thrust + body-rate setpoints PX4 does its own allocation.
 """
 from __future__ import annotations
 
@@ -38,9 +41,11 @@ PX4_DGYRO_CUTOFF_HZ = 20.0     # IMU_DGYRO_CUTOFF in duckiedrone-px4-v4.params
 
 # Quad-X allocation, FLU torques, motor order m1 FR, m2 BR, m3 BL, m4 FL.
 # (sign of each motor's contribution to +roll / +pitch / +yaw torque)
+# Yaw: m1/m3 are CCW props (CA_ROTOR0/1_KM = +0.05) whose reaction turns the body
+# clockwise (-z FLU), so +yaw comes from speeding up the CW props m2/m4.
 ALLOC_ROLL = (-1.0, -1.0, 1.0, 1.0)
 ALLOC_PITCH = (-1.0, 1.0, 1.0, -1.0)
-ALLOC_YAW = (1.0, -1.0, 1.0, -1.0)
+ALLOC_YAW = (-1.0, 1.0, -1.0, 1.0)
 MIX_RP, MIX_Y = 0.7071, 1.0    # PX4 quad-X normalisation (roll/pitch 1/sqrt2, yaw 1)
 
 

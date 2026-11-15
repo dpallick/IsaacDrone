@@ -37,5 +37,8 @@ The actor outputs s in [0,1]^4 (sigmoid). Then a = 2s - 1 and:
 * `body_rate.x, .y, .z` = a1 * 2.5, a2 * 2.5, a3 * 1.5 rad/s (FLU; MAVROS converts to FRD)
 * `type_mask` = IGNORE_ATTITUDE (128): rates + thrust only
 
+Motor numbering is irrelevant here (PX4 allocates). For reference only, sim
+(m1 FR, m2 BR, m3 BL, m4 FL) -> PX4 motors (1 = m1, 2 = m3, 3 = m4, 4 = m2).
+
 PX4 must be in OFFBOARD with setpoints streaming (> 2 Hz) before the switch.
 Keep a manual takeover (RC switch) and a ToF-based height cutoff in the node.
