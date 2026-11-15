@@ -19,7 +19,7 @@ ISAAC_CACHE="${ISAAC_CACHE:-$ISAAC_ROOT/cache}"
 PYUSER="${PYUSER:-$ISAAC_ROOT/pyuser}"
 
 isaac_exec() {
-    mkdir -p "$ISAAC_CACHE"/{kit,ov,pip,glcache,computecache,logs,data,documents} "$PYUSER"
+    mkdir -p "$ISAAC_CACHE"/{kit,kitdata,kitlogs,ov,pip,glcache,computecache,logs,data,documents} "$PYUSER"
     # Apptainer runs as YOU (not root), so Omniverse caches land under $HOME
     # inside the container. Redirect each of them to scratch.
     apptainer exec --nv \
@@ -31,6 +31,8 @@ isaac_exec() {
         --bind "$SCRATCH_ROOT" \
         --bind "$REPO_DIR" \
         --bind "$ISAAC_CACHE/kit:/isaac-sim/kit/cache" \
+        --bind "$ISAAC_CACHE/kitdata:/isaac-sim/kit/data" \
+        --bind "$ISAAC_CACHE/kitlogs:/isaac-sim/kit/logs" \
         --bind "$ISAAC_CACHE/ov:$HOME/.cache/ov" \
         --bind "$ISAAC_CACHE/pip:$HOME/.cache/pip" \
         --bind "$ISAAC_CACHE/glcache:$HOME/.cache/nvidia/GLCache" \

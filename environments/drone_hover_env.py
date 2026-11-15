@@ -16,8 +16,46 @@ from isaaclab.sensors.imu import Imu, ImuCfg
 
 from pxr import UsdGeom
 
-from .dd24_params import DD24
+from .dd24_params import (DD24, DD24_TOF_SENSORS, TOF_MAX_RANGE_M, TOF_MIN_RANGE_M,
+                          TOF_NOISE_STD_M, TOF_NOISE_STD_FRAC)
 from . import arena as A
+
+
+def quat_rotate(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """Rotate vectors v (..., 3) by unit quaternions q (..., 4) in (w, x, y, z) order."""
+    w, xyz = q[..., :1], q[..., 1:]
+    t = 2.0 * torch.cross(xyz, v, dim=-1)
+    return v + w * t + torch.cross(xyz, t, dim=-1)
+
+
+def tof_ranges(pos_local, quat, sensor_pos_b, sensor_dir_b, half_xy, height):
+    """True range from each ToF sensor to the floor / net walls / net ceiling.
+
+    pos_local: (N, 3) drone CG position relative to the arena centre (floor at z=0)
+    quat:      (N, 4) drone attitude (w, x, y, z)
+    sensor_pos_b, sensor_dir_b: (S, 3) mounting point and pointing direction in the body frame
+    half_xy:   (2,) half-size of the net; height: ceiling height (<= 0 = no ceiling)
+    Returns (range (N, S), hit_net (N, S) bool). From inside the box the nearest
+    positive plane crossing is where the ray exits, i.e. what the sensor sees.
+    """
+    N, S = pos_local.shape[0], sensor_pos_b.shape[0]
+    q = quat[:, None, :].expand(N, S, 4)
+    origin = pos_local[:, None, :] + quat_rotate(q, sensor_pos_b[None].expand(N, S, 3))
+    d = quat_rotate(q, sensor_dir_b[None].expand(N, S, 3))
+    inf = torch.full((N, S), float("inf"), device=pos_local.device)
+
+    def plane(axis, value):
+        dk = d[..., axis]
+        t = (value - origin[..., axis]) / torch.where(dk.abs() < 1e-9, torch.full_like(dk, 1e-9), dk)
+        return torch.where(t > 0, t, inf)
+
+    t_floor = plane(2, 0.0)
+    t_net = torch.minimum(torch.minimum(plane(0, half_xy[0]), plane(0, -half_xy[0])),
+                          torch.minimum(plane(1, half_xy[1]), plane(1, -half_xy[1])))
+    if height > 0:
+        t_net = torch.minimum(t_net, plane(2, height))
+    rng = torch.minimum(t_floor, t_net)
+    return rng, t_net < t_floor
 
 
 @configclass
@@ -25,9 +63,10 @@ class DroneHoverEnvCfg(DirectRLEnvCfg):
     episode_length_s = 20.0
     decimation = 2
     action_space = 4
-    # [imu_acc(3), z_err(1), quat(4), lin_vel(3), ang_vel(3), xy_err(2)]
-    # xy_err is appended LAST so obs[:, 0:14] keeps the old layout (PID still works).
-    observation_space = 16
+    # [imu_acc(3), z_err(1), quat(4), lin_vel(3), gyro_body(3), xy_err(2), tof(S)]
+    # New fields are appended LAST so obs[:, 0:14] keeps the old layout (PID still works).
+    # tof = range / tof_max_range in [0, 1], one per sensor in `tof_sensors`.
+    observation_space = 16 + 1
     state_space = 0
     sim: SimulationCfg = SimulationCfg(
         dt=1 / 100,
@@ -57,6 +96,19 @@ class DroneHoverEnvCfg(DirectRLEnvCfg):
     max_thrust_to_weight = 2.2
     yaw_coeff = 0.00001
     max_prop_visual_speed = 50000.0
+    # ---- Time-of-flight range sensors -----------------------------------------
+    # (name, position in body frame (m), pointing direction). Each is ray-cast from
+    # its own mounting point, so tilting the drone changes the readings as it would
+    # for real. The Crazyflie default is a single downward sensor at the centre.
+    tof_sensors = (("down", (0.0, 0.0, -0.01), (0.0, 0.0, -1.0)),)
+    tof_max_range = TOF_MAX_RANGE_M
+    tof_min_range = TOF_MIN_RANGE_M
+    tof_noise_std = TOF_NOISE_STD_M
+    tof_noise_frac = TOF_NOISE_STD_FRAC
+    # [TODO] How often an IR ToF fails to see the NET (sparse mesh) and reports
+    # "out of range" instead. 0 = net always detected like a solid wall.
+    tof_net_dropout = 0.0
+
     # Prop prims to spin for visuals. Missing prims just disable the effect.
     prop_visual_paths = (
         "m1_prop/ccw_prop",
@@ -110,6 +162,9 @@ class DroneHoverEnvCfgDD24(DroneHoverEnvCfg):
     yaw_coeff = DD24.yaw_coeff
     # URDF-imported props are links named m{i}_prop; spin the link's visuals.
     prop_visual_paths = ("m1_prop", "m2_prop", "m3_prop", "m4_prop")
+    # Five ToFs at their CAD positions (see dd24_params.DD24_TOF_SENSORS).
+    tof_sensors = DD24_TOF_SENSORS
+    observation_space = 16 + len(DD24_TOF_SENSORS)
 
     def __post_init__(self):
         super().__post_init__()
@@ -145,6 +200,11 @@ class DroneHoverEnv(DirectRLEnv):
         self._target_local = torch.tensor(
             [0.0, 0.0, self.cfg.hover_height], device=self.device
         )
+        self._tof_pos_b = torch.tensor([t[1] for t in self.cfg.tof_sensors], device=self.device)
+        self._tof_dir_b = torch.tensor([t[2] for t in self.cfg.tof_sensors], device=self.device)
+        self._tof_dir_b = self._tof_dir_b / torch.linalg.norm(self._tof_dir_b, dim=-1, keepdim=True)
+        assert self.cfg.observation_space == 16 + len(self.cfg.tof_sensors), \
+            "observation_space must be 16 + number of ToF sensors"
         self._half_xy = torch.tensor(
             [self.cfg.arena_size_xy[0] / 2.0, self.cfg.arena_size_xy[1] / 2.0],
             device=self.device,
@@ -236,6 +296,20 @@ class DroneHoverEnv(DirectRLEnv):
             d = torch.minimum(d, self.cfg.arena_height - pos_local[:, 2])
         return d
 
+    def _tof_readings(self, pos_local: torch.Tensor) -> torch.Tensor:
+        """Simulated ToF measurements (m): true range + noise, clipped to the sensor's
+        limits, with optional dropouts when the target is the net."""
+        rng, hit_net = tof_ranges(pos_local, self.drone.data.root_quat_w, self._tof_pos_b,
+                                  self._tof_dir_b, self._half_xy, self.cfg.arena_height)
+        noise = torch.randn_like(rng) * (self.cfg.tof_noise_std + self.cfg.tof_noise_frac * rng.clamp(max=10.0))
+        meas = rng + noise
+        if self.cfg.tof_net_dropout > 0:
+            drop = hit_net & (torch.rand_like(rng) < self.cfg.tof_net_dropout)
+            meas = torch.where(drop, torch.full_like(meas, self.cfg.tof_max_range), meas)
+        # Beyond max range a real ToF reports "no target"; encode that as max range.
+        meas = torch.where(rng > self.cfg.tof_max_range, torch.full_like(meas, self.cfg.tof_max_range), meas)
+        return meas.clamp(self.cfg.tof_min_range, self.cfg.tof_max_range)
+
     # ------------------------------------------------------------ observations
     def _get_observations(self):
         pos = self._local_pos()
@@ -244,14 +318,19 @@ class DroneHoverEnv(DirectRLEnv):
         z_error = self.cfg.hover_height - pos[:, 2:3]
         xy_error = -pos[:, 0:2]               # target (0,0) minus position
 
+        # Rotation rates as a real gyro reports them: in the drone's own (body) axes.
+        gyro_b = self.imu.data.ang_vel_b
+        tof = self._tof_readings(pos) / self.cfg.tof_max_range
+
         obs = torch.cat(
             [
                 lin_acc_b,
                 z_error,
                 data.root_quat_w,
                 data.root_lin_vel_w,
-                data.root_ang_vel_w,
+                gyro_b,
                 xy_error,
+                tof,
             ],
             dim=-1,
         )
