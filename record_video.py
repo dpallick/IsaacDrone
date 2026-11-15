@@ -78,7 +78,7 @@ def main():
 
     env = DroneHoverEnv(cfg=cfg, render_mode="rgb_array")
     dev = env.device
-    actor = RLHoverActor(obs_dim=ck.get("obs_dim", 14), action_dim=4).to(dev)
+    actor = RLHoverActor(obs_dim=ck.get("obs_dim", 14), action_dim=4, out=ck.get("actor_out", "sigmoid")).to(dev)
     actor.load_state_dict(ck["actor"])
     actor.eval()
     from controllers.obs_norm import load_obs_norm

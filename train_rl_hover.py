@@ -39,7 +39,7 @@ parser.add_argument("--init_log_std", type=float, default=-1.6,
                          "(about +-0.4 in a: +-1 rad/s rate noise). Much smaller makes the KL "
                          "hypersensitive and the adaptive lr collapses.")
 parser.add_argument("--lr_min", type=float, default=1e-5)
-parser.add_argument("--lr_max", type=float, default=1e-2)
+parser.add_argument("--lr_max", type=float, default=1e-3)
 parser.add_argument("--scenario", default="random",
                     choices=["random", "net_only", "net_in_room", "room", "open", "fixed_net"],
                     help="Scenes to train in (random = mix of nets, rooms, open halls)")
@@ -106,7 +106,7 @@ def main():
     def critic_in(o):
         return o["critic"] if "critic" in o else o["policy"]
 
-    actor = RLHoverActor(obs_dim=obs_dim, action_dim=4).to(device)
+    actor = RLHoverActor(obs_dim=obs_dim, action_dim=4, out="linear").to(device)
     critic = Critic(obs_dim=critic_dim).to(device)
     # Running input normalisation (saved in the checkpoint, frozen at deployment).
     actor_norm = RunningNorm(obs_dim).to(device)
@@ -134,6 +134,7 @@ def main():
     def checkpoint(it, best_reward):
         return {
             "actor": actor.state_dict(),
+            "actor_out": "linear",
             "obs_norm": actor_norm.to_dict(),
             "critic_norm": critic_norm.to_dict(),
             "critic": critic.state_dict(),
@@ -302,6 +303,7 @@ def main():
 
         for _ in range(args.epochs):
             perm = indices[torch.randperm(batch_size, device=device)]
+            ep_kl_sum, ep_kl_n = 0.0, 0
 
             for start in range(0, batch_size, mb_size):
                 mb_idx = perm[start:start + mb_size]
@@ -320,14 +322,8 @@ def main():
                     kl = ((ratio - 1.0) - log_ratio).mean().item()
                 kl_sum += kl
                 kl_n += 1
-                if args.lr_schedule == "adaptive":
-                    lr_now = optimizer.param_groups[0]["lr"]
-                    if kl > 2.0 * args.desired_kl:
-                        lr_now = max(lr_now / 1.5, args.lr_min)
-                    elif 0.0 < kl < 0.5 * args.desired_kl:
-                        lr_now = min(lr_now * 1.5, args.lr_max)
-                    for g in optimizer.param_groups:
-                        g["lr"] = lr_now
+                ep_kl_sum += kl
+                ep_kl_n += 1
 
                 pg_loss_1 = -b_advantages[mb_idx] * ratio
                 pg_loss_2 = -b_advantages[mb_idx] * torch.clamp(
@@ -350,6 +346,21 @@ def main():
                     1.0,
                 )
                 optimizer.step()
+
+            # Adapt the learning rate ONCE per epoch from this epoch's mean KL (per
+            # minibatch compounded x1.5^20 per iteration and ran away in smoke test 2).
+            ep_kl = ep_kl_sum / max(ep_kl_n, 1)
+            if args.lr_schedule == "adaptive":
+                lr_now = optimizer.param_groups[0]["lr"]
+                if ep_kl > 2.0 * args.desired_kl:
+                    lr_now = max(lr_now / 1.5, args.lr_min)
+                elif ep_kl < 0.5 * args.desired_kl:
+                    lr_now = min(lr_now * 1.5, args.lr_max)
+                for g in optimizer.param_groups:
+                    g["lr"] = lr_now
+            # Standard PPO safety: stop this iteration's updates if the policy moved too far.
+            if ep_kl > 4.0 * args.desired_kl:
+                break
 
         mean_reward = reward_buf.mean().item()
         lr_now = optimizer.param_groups[0]["lr"]

@@ -108,8 +108,11 @@ These thresholds live in the eval scripts.
 ### Training settings (why)
 * Inputs are normalised with running mean/std (saved in the checkpoint).
 * 4 minibatches x 5 epochs per iteration (20 updates), as in Isaac Lab's rsl_rl.
-* Initial action noise log_std = -1.6. Together these keep the adaptive learning
-  rate in a useful range; without them it collapsed to 1e-5 in the first smoke test.
+* Initial action noise log_std = -1.6.
+* Learning rate adapted once per epoch (not per minibatch), capped at 1e-3, and an
+  epoch stops early if KL > 0.04. Actor output is linear (clamped by the env), so it
+  can't saturate. History: smoke test 1 had lr collapse to 1e-5; smoke test 2 had it
+  run away to 1e-2 and saturate the sigmoid output.
 
 ### Learning rate
 Training uses an **adaptive** schedule by default: after every minibatch the

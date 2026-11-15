@@ -3,16 +3,23 @@ import torch.nn as nn
 
 
 class RLHoverActor(nn.Module):
-    def __init__(self, obs_dim=14, action_dim=4):
+    """MLP policy mean in [0, 1]-action space.
+
+    out="linear" (new runs): plain linear output, initialised at 0.5 with tiny weights;
+        the env clamps to [0, 1]. Can't saturate, so gradients never vanish.
+    out="sigmoid" (old checkpoints): sigmoid output. A large learning rate can push it
+        to 0/1, where it stops learning (seen in the 2nd smoke test).
+    """
+    def __init__(self, obs_dim=14, action_dim=4, out="sigmoid"):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(obs_dim, 128),
-            nn.ELU(),
-            nn.Linear(128, 128),
-            nn.ELU(),
-            nn.Linear(128, action_dim),
-            nn.Sigmoid(),
-        )
+        layers = [nn.Linear(obs_dim, 128), nn.ELU(), nn.Linear(128, 128), nn.ELU(), nn.Linear(128, action_dim)]
+        if out == "sigmoid":
+            layers.append(nn.Sigmoid())
+        else:
+            nn.init.orthogonal_(layers[-1].weight, gain=0.01)
+            nn.init.constant_(layers[-1].bias, 0.5)
+        self.out = out
+        self.net = nn.Sequential(*layers)
 
     def forward(self, obs):
         return self.net(obs)
@@ -43,7 +50,7 @@ class RLHoverController:
                 state = state["actor"]
 
         self.obs_dim = obs_dim
-        self.policy = RLHoverActor(obs_dim=obs_dim).to(device)
+        self.policy = RLHoverActor(obs_dim=obs_dim, out=ck.get("actor_out", "sigmoid")).to(device)
         self.policy.eval()
         if state is not None:
             self.policy.load_state_dict(state)
