@@ -14,7 +14,17 @@ mkdir -p oscar/logs
 
 SEEDS="${SEEDS:-0-2}"
 ONLY="${ONLY:-all}"
-STAMP="$(date +%m%d)"
+# Month-day-hour-minute, so two submissions never share run folders.
+STAMP="$(date +%m%d_%H%M)"
+
+# Refuse to start a second batch on top of one that's still queued/running.
+EXISTING="$(squeue -u "$USER" -h -o "%j" | grep -cE '^(isaac_hover|rotorpy_hover)' || true)"
+if [ "$EXISTING" -gt 0 ] && [ "${FORCE:-0}" != "1" ]; then
+    echo "You already have $EXISTING training job(s) queued or running:"
+    squeue -u "$USER" -o "%.14i %.16j %.8T %.10M %.20R" | grep -E 'JOBID|isaac_ho|rotorpy_' || true
+    echo "Cancel them first (scancel -u $USER) or rerun with FORCE=1 to add another batch."
+    exit 1
+fi
 MAIL=()
 [ -n "${MAIL_USER:-}" ] && MAIL=(--mail-type=END,FAIL --mail-user="$MAIL_USER")
 
