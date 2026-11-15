@@ -39,5 +39,8 @@ isaac_exec() {
         --bind "$ISAAC_CACHE/data:$HOME/.local/share/ov/data" \
         --bind "$ISAAC_CACHE/documents:$HOME/Documents" \
         "$SIF" \
-        bash -lc "$*"
+        env -u BASH_ENV -u 'BASH_FUNC_module%%' -u 'BASH_FUNC_ml%%' \
+        bash -c "$*"
+    # (env -u ...: Oscar exports its Lmod `module` function into every shell; it
+    #  points at host paths that don't exist in the container, so drop it.)
 }
