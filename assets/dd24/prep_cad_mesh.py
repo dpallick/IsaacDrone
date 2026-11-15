@@ -25,9 +25,11 @@ while True:
     cell *= 1.25
 print(f"grid cell {cell:.2f} mm")
 v = v / 1000.0                                            # mm -> m
-# CAD long axis is +y; user's measured Iyy > Ixx says the long axis is the roll (x) axis.
-# Rotate -90 deg about z: CAD (x, y) -> (y, -x), so CAD +y becomes +x (forward).
-v = np.stack([v[:, 1], -v[:, 0], v[:, 2]], axis=1)
+# The camera (with its printed mount and ribbon cable) sits at the CAD -y tip, and the
+# camera side is the front. Rotate +90 deg about z: CAD (x, y) -> (-y, x), so CAD -y
+# becomes +x (forward), matching the body frame used by the env (x fwd, y left, z up).
+# This also lines the long axis up with roll (x), consistent with measured Iyy > Ixx.
+v = np.stack([-v[:, 1], v[:, 0], v[:, 2]], axis=1)
 cg = np.array([0.0, 0.0, 0.0537])                         # bbox centre; [EST] CG height
 v -= cg
 out = trimesh.Trimesh(v, f, process=True)
