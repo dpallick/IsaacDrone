@@ -19,6 +19,7 @@ from pxr import UsdGeom
 from .dd24_params import (DD24, DD24_TOF_SENSORS, TOF_MAX_RANGE_M, TOF_MIN_RANGE_M,
                           TOF_NOISE_STD_M, TOF_NOISE_STD_FRAC)
 from . import arena as A
+from .scenes import SCENARIOS, assign, empty_scenes, sample_scenes, scene_ranges
 
 
 def quat_rotate(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
@@ -65,7 +66,8 @@ class DroneHoverEnvCfg(DirectRLEnvCfg):
     action_space = 4
     # ---- What the policy observes ----------------------------------------------
     # "onboard" (default): ONLY what the real drone measures, with its imperfections:
-    #     per step [accel_b(3), gyro_b(3), gravity_dir_b(3), tof(S), prev_cmd(4)]
+    #     per step [accel_b(3), gyro_b(3), gravity_dir_b(3), tof(S), prev_cmd(4),
+    #               flow_vel_b(2), flow_valid(1), target_height(1)]
     #     stacked over the last `obs_history` policy steps, so velocity has to be
     #     inferred from how the readings change. No ground-truth height / position /
     #     velocity. tof = range / tof_max_range in [0, 1].
@@ -128,6 +130,41 @@ class DroneHoverEnvCfg(DirectRLEnvCfg):
     gravity_dir_noise_std = 0.01           # attitude estimate (roll/pitch) error...
     gravity_dir_bias_range = 0.03          # ...incl. ~2 deg IMU mounting misalignment
     thrust_scale_range = (0.90, 1.10)      # per motor: motor/prop/battery spread, mass error
+    # Spurious short ToF returns (people walking past, multipath, dust): per episode
+    # P(reading replaced by a random shorter distance).
+    tof_ghost_range = (0.0, 0.03)
+
+    # ---- Optical flow (downward), as PX4 gives it: horizontal velocity in the body
+    # frame = flow rate x height, so its error scales with the DOWN ToF's error. --------
+    flow_noise_std = 0.05                  # m/s
+    flow_noise_per_m = 0.03                # extra m/s of noise per metre of height
+    flow_scale_range = (0.90, 1.10)        # per-episode calibration (focal length) error
+    flow_dropout_range = (0.0, 0.3)        # per-episode P(no valid flow): floor texture/light
+    flow_height_range = (0.08, 4.0)        # m; outside this the sensor reports invalid
+
+    # ---- Scenes (re-drawn every episode; see environments/scenes.py) ------------
+    # "random" draws from scene_probs; or force one of scenes.SCENARIOS, e.g.
+    # "fixed_net" = the original fixed arena (used for videos / old comparisons).
+    scenario = "random"
+    #             net_only net_in_room room  open  fixed_net
+    scene_probs = (0.20,   0.35,       0.30, 0.15, 0.0)
+    scene_net_side = (2.5, 5.0)            # m, inner side length of the net (each axis)
+    scene_net_height = (2.0, 3.5)
+    scene_net_ceiling_prob = 0.7           # else the net is open at the top
+    scene_room_gap = (0.3, 3.0)            # net -> room wall distance
+    scene_room_side = (3.0, 9.0)           # rooms without a net
+    scene_room_height = (2.4, 4.0)
+    scene_furniture_band = (0.4, 1.0)      # furniture zone along room walls (no-fly)
+    scene_open_side = (3.0, 6.0)           # virtual keep-in box in open halls
+    scene_virtual_ceiling = 4.0
+    scene_clutter_max = 6                  # boxes per scene (furniture, people, poles)
+    scene_clutter_prob = 0.5               # each one present with this probability
+    scene_clutter_half_xy = (0.1, 0.5)
+    scene_clutter_half_z = (0.2, 1.0)
+    scene_clutter_reach = 2.5              # how far outside the keep-in box they can be
+    # Hover task in random scenes: hold the SPAWN position at a random target height
+    # (given to the policy as an input). fixed_net keeps the old centre @ hover_height.
+    target_height_range = (0.6, 1.5)
 
     # Prop prims to spin for visuals. Missing prims just disable the effect.
     prop_visual_paths = (
@@ -177,14 +214,15 @@ class DroneHoverEnvCfg(DirectRLEnvCfg):
             parent()
         S = len(self.tof_sensors)
         if self.obs_mode == "onboard":
-            self.observation_space = (13 + S) * self.obs_history
+            self.observation_space = (17 + S) * self.obs_history
         elif self.obs_mode == "privileged":
             self.observation_space = 16 + S
         else:
             raise ValueError(f"obs_mode must be 'onboard' or 'privileged', not {self.obs_mode!r}")
-        # critic: rel. position(3), velocity(3), quat(4), body rates(3), true ToF(S),
-        # this episode's net-dropout prob(1) and motor thrust scales(4)
-        self.state_space = 18 + S
+        # critic: pos - target(3), velocity(3), quat(4), body rates(3), true ToF(S),
+        # net-dropout prob(1), motor thrust scales(4), keep-in box(3), scenario
+        # one-hot(len(SCENARIOS)), ghost prob(1), flow dropout prob(1)
+        self.state_space = 18 + S + 3 + len(SCENARIOS) + 2
 
 
 @configclass
@@ -236,6 +274,22 @@ class DroneHoverEnv(DirectRLEnv):
         # Per-motor command (0..1) that exactly cancels gravity.
         self.hover_motor = 1.0 / self.cfg.max_thrust_to_weight
 
+        self._alloc_buffers()
+
+        inertia = self.drone.root_physx_view.get_inertias()[0, self.body_id[0]]
+        print(f"Drone mass: {self.mass:.4f} kg  | body inertia diag: "
+              f"{inertia.view(3, 3).diagonal().tolist()}")
+        print(f"Hover thrust: {self.hover_thrust:.3f} N | max motor thrust: "
+              f"{self.max_motor_thrust:.3f} N | hover cmd: {self.hover_motor:.3f}")
+        print("Joint names:", self.drone.joint_names)
+        print(f"Arena (net) inner size: {self.cfg.arena_size_xy} x {self.cfg.arena_height} m, "
+              f"margin {self.cfg.net_margin} m")
+        self._prop_xforms = None
+
+    def _alloc_buffers(self):
+        """Per-env buffers (sensor layout, randomisation draws, scenes, targets,
+        observation history). Separate from __init__ so tests can build them too."""
+        self.actions = torch.zeros(self.num_envs, 4, device=self.device)
         self._target_local = torch.tensor(
             [0.0, 0.0, self.cfg.hover_height], device=self.device
         )
@@ -249,24 +303,21 @@ class DroneHoverEnv(DirectRLEnv):
         self._gyro_bias = torch.zeros(N, 3, device=self.device)
         self._grav_bias = torch.zeros(N, 3, device=self.device)
         self._thrust_scale = torch.ones(N, 4, device=self.device)
+        self._tof_ghost_p = torch.zeros(N, 1, device=self.device)
+        self._flow_scale = torch.ones(N, 1, device=self.device)
+        self._flow_drop_p = torch.zeros(N, 1, device=self.device)
+        names = [t[0] for t in self.cfg.tof_sensors]
+        self._down_idx = names.index("down") if "down" in names else None
+        self._scene = empty_scenes(N, self.cfg.scene_clutter_max, self.device)
+        self._target = self._target_local.repeat(N, 1)      # per-env hover target
         # Observation history for "onboard" mode.
-        self._frame_dim = 13 + S
+        self._frame_dim = 17 + S
         self._hist = torch.zeros(N, self.cfg.obs_history, self._frame_dim, device=self.device)
         self._hist_fill = torch.ones(N, dtype=torch.bool, device=self.device)
         self._half_xy = torch.tensor(
             [self.cfg.arena_size_xy[0] / 2.0, self.cfg.arena_size_xy[1] / 2.0],
             device=self.device,
         )
-
-        inertia = self.drone.root_physx_view.get_inertias()[0, self.body_id[0]]
-        print(f"Drone mass: {self.mass:.4f} kg  | body inertia diag: "
-              f"{inertia.view(3, 3).diagonal().tolist()}")
-        print(f"Hover thrust: {self.hover_thrust:.3f} N | max motor thrust: "
-              f"{self.max_motor_thrust:.3f} N | hover cmd: {self.hover_motor:.3f}")
-        print("Joint names:", self.drone.joint_names)
-        print(f"Arena (net) inner size: {self.cfg.arena_size_xy} x {self.cfg.arena_height} m, "
-              f"margin {self.cfg.net_margin} m")
-        self._prop_xforms = None
 
     # ------------------------------------------------------------------ scene
     def _setup_scene(self):
@@ -370,29 +421,61 @@ class DroneHoverEnv(DirectRLEnv):
         return self.drone.data.root_pos_w - self.scene.env_origins
 
     def _dist_to_net(self, pos_local: torch.Tensor) -> torch.Tensor:
-        """Distance from the drone to the nearest net face (walls, and ceiling if any)."""
-        d_xy = self._half_xy - pos_local[:, 0:2].abs()          # (N, 2)
-        d = d_xy.min(dim=-1).values
-        if self.cfg.arena_height > 0:
-            d = torch.minimum(d, self.cfg.arena_height - pos_local[:, 2])
-        return d
+        """Distance to the nearest face of this env's keep-in box (net, furniture line
+        or virtual fence; walls and ceiling)."""
+        d = (self._scene["keep_half"] - pos_local[:, 0:2].abs()).min(dim=-1).values
+        return torch.minimum(d, self._scene["keep_h"] - pos_local[:, 2])
 
     def _tof_readings(self, pos_local: torch.Tensor):
-        """Simulated ToF measurements (m) and the true ranges.
+        """Simulated ToF measurements and true ranges (m), each (N, S).
 
-        measured = true range + distance-dependent noise, clipped to the sensor's
-        limits; readings whose target is the NET drop to "no target" (max range) with
-        this episode's probability; any reading can glitch to "no target"."""
-        rng, hit_net = tof_ranges(pos_local, self.drone.data.root_quat_w, self._tof_pos_b,
-                                  self._tof_dir_b, self._half_xy, self.cfg.arena_height)
-        mx = self.cfg.tof_max_range
-        noise = torch.randn_like(rng) * (self.cfg.tof_noise_std + self.cfg.tof_noise_frac * rng.clamp(max=10.0))
-        meas = rng + noise
-        drop = hit_net & (torch.rand_like(rng) < self._tof_drop_p)
-        drop |= torch.rand_like(rng) < self.cfg.tof_glitch_prob
-        drop |= rng > mx                     # beyond range: "no target"
-        meas = torch.where(drop, torch.full_like(meas, mx), meas)
-        return meas.clamp(self.cfg.tof_min_range, mx), rng.clamp(max=mx)
+        Beams are cast from each sensor's mounting point against this env's scene.
+        A beam that reaches the NET is caught with prob 1 - drop_p; otherwise it
+        passes through to whatever is behind (room wall, clutter, or nothing).
+        Then: distance-dependent noise, "no target" beyond max range, random
+        glitches, and occasional spurious short "ghost" returns."""
+        N, S = pos_local.shape[0], self._tof_pos_b.shape[0]
+        q = self.drone.data.root_quat_w[:, None, :].expand(N, S, 4)
+        o = pos_local[:, None, :] + quat_rotate(q, self._tof_pos_b[None].expand(N, S, 3))
+        d = quat_rotate(q, self._tof_dir_b[None].expand(N, S, 3))
+        r = scene_ranges(o, d, self._scene)
+        solid = torch.minimum(torch.minimum(r["floor"], r["room"]), r["clutter"])
+        true = torch.minimum(solid, r["net"])
+        net_caught = torch.rand_like(true) >= self._tof_drop_p
+        seen = torch.minimum(solid, torch.where(net_caught, r["net"], torch.full_like(true, float("inf"))))
+
+        mx, mn = self.cfg.tof_max_range, self.cfg.tof_min_range
+        finite = torch.where(torch.isfinite(seen), seen, torch.full_like(seen, 2 * mx))
+        meas = finite + torch.randn_like(finite) * (self.cfg.tof_noise_std + self.cfg.tof_noise_frac * finite.clamp(max=mx))
+        ghost = torch.rand_like(meas) < self._tof_ghost_p
+        meas = torch.where(ghost, mn + torch.rand_like(meas) * (meas.clamp(max=mx) - mn), meas)
+        no_target = (finite > mx) & ~ghost
+        no_target |= torch.rand_like(meas) < self.cfg.tof_glitch_prob
+        meas = torch.where(no_target, torch.full_like(meas, mx), meas)
+        return meas.clamp(mn, mx), true.clamp(max=mx)
+
+    def _optical_flow(self, tof_meas: torch.Tensor, tof_true: torch.Tensor) -> torch.Tensor:
+        """Downward optical flow -> body-frame horizontal velocity (N, 2) + valid flag (N, 1).
+
+        Like PX4: velocity = flow rate x height from the DOWN ToF, so a bad height
+        reading scales the velocity wrong. Invalid (zeros, flag 0) when too low/high,
+        when the floor has too little texture/light (per-episode dropout), or when
+        the down ToF has no reading."""
+        N = tof_meas.shape[0]
+        if self._down_idx is None:
+            return torch.zeros(N, 3, device=self.device)
+        q = self.drone.data.root_quat_w
+        q_inv = q * torch.tensor([1.0, -1.0, -1.0, -1.0], device=self.device)
+        v_b = quat_rotate(q_inv, self.drone.data.root_lin_vel_w)[:, 0:2]
+        h_true = tof_true[:, self._down_idx:self._down_idx + 1]
+        h_meas = tof_meas[:, self._down_idx:self._down_idx + 1]
+        ratio = (h_meas / h_true.clamp(min=1e-3)).clamp(0.25, 4.0)
+        noise = torch.randn_like(v_b) * (self.cfg.flow_noise_std + self.cfg.flow_noise_per_m * h_true)
+        v = v_b * ratio * self._flow_scale + noise
+        lo, hi = self.cfg.flow_height_range
+        valid = (h_true > lo) & (h_true < hi) & (h_meas < self.cfg.tof_max_range) \
+            & (torch.rand_like(h_true) >= self._flow_drop_p)
+        return torch.cat([torch.where(valid, v, torch.zeros_like(v)), valid.float()], dim=-1)
 
     # ------------------------------------------------------------ observations
     def _get_observations(self):
@@ -404,11 +487,11 @@ class DroneHoverEnv(DirectRLEnv):
         if self.cfg.obs_mode == "privileged":
             policy = torch.cat([
                 self.imu.data.lin_acc_b,
-                self.cfg.hover_height - pos[:, 2:3],
+                self._target[:, 2:3] - pos[:, 2:3],
                 data.root_quat_w,
                 data.root_lin_vel_w,
                 self.imu.data.ang_vel_b,
-                -pos[:, 0:2],
+                self._target[:, 0:2] - pos[:, 0:2],
                 tof_m / mx,
             ], dim=-1)
         else:
@@ -424,7 +507,9 @@ class DroneHoverEnv(DirectRLEnv):
                 + torch.randn_like(self._grav_bias) * self.cfg.gravity_dir_noise_std
             grav = grav / torch.linalg.norm(grav, dim=-1, keepdim=True)
             prev_cmd = (self.actions - self.hover_motor) / self.hover_motor
-            frame = torch.cat([accel, gyro, grav, tof_m / mx, prev_cmd], dim=-1)
+            flow = self._optical_flow(tof_m, tof_true)
+            frame = torch.cat([accel, gyro, grav, tof_m / mx, prev_cmd, flow,
+                               self._target[:, 2:3]], dim=-1)
 
             self._hist = torch.cat([self._hist[:, 1:], frame[:, None]], dim=1)
             fill = self._hist_fill
@@ -433,14 +518,19 @@ class DroneHoverEnv(DirectRLEnv):
                 self._hist_fill[fill] = False
             policy = self._hist.reshape(self.num_envs, -1)
 
+        sc = self._scene
         critic = torch.cat([
-            pos - self._target_local,
+            pos - self._target,
             data.root_lin_vel_w,
             data.root_quat_w,
             data.root_ang_vel_b,
             tof_true / mx,
             self._tof_drop_p,
             self._thrust_scale,
+            sc["keep_half"], sc["keep_h"][:, None],
+            torch.nn.functional.one_hot(sc["scen"], len(SCENARIOS)).float(),
+            self._tof_ghost_p,
+            self._flow_drop_p,
         ], dim=-1)
         return {"policy": policy, "critic": critic}
 
@@ -448,7 +538,7 @@ class DroneHoverEnv(DirectRLEnv):
     def _get_rewards(self):
         pos = self._local_pos()
         data = self.drone.data
-        err = pos - self._target_local
+        err = pos - self._target
 
         # Soft "don't go near the net" term: 0 far away, ramps to 1 at the hard margin.
         dist = self._dist_to_net(pos)
@@ -497,10 +587,26 @@ class DroneHoverEnv(DirectRLEnv):
         def u(lo, hi, *shape):
             return torch.empty(*shape, device=dev).uniform_(lo, hi)
 
-        r = self.cfg.spawn_xy_range
-        local = torch.stack(
-            [u(-r, r, n), u(-r, r, n), u(*self.cfg.spawn_z_range, n)], dim=-1
-        )
+        # New scene for these envs (or the fixed arena).
+        c = self.cfg
+        scene = sample_scenes(n, c, dev, c.scenario)
+        assign(self._scene, scene, env_ids)
+        fixed = scene["scen"] == SCENARIOS.index("fixed_net")
+
+        # Spawn well inside the keep-in box; random scenes hold the spawn xy at a
+        # random target height, fixed_net keeps the old centre @ hover_height.
+        room_xy = (scene["keep_half"] - (c.net_margin + c.net_warn_band + 0.2)).clamp(min=0.2)
+        r = c.spawn_xy_range
+        xy_rand = (torch.rand(n, 2, device=dev) * 2 - 1) * room_xy
+        xy = torch.where(fixed[:, None], (torch.rand(n, 2, device=dev) * 2 - 1) * r, xy_rand)
+        z_hi = torch.minimum(torch.full((n,), c.spawn_z_range[1], device=dev), scene["keep_h"] - 0.7)
+        z = c.spawn_z_range[0] + torch.rand(n, device=dev) * (z_hi - c.spawn_z_range[0]).clamp(min=0.05)
+        local = torch.cat([xy, z[:, None]], dim=-1)
+        th_hi = torch.minimum(torch.full((n,), c.target_height_range[1], device=dev), scene["keep_h"] - 0.8)
+        th = c.target_height_range[0] + torch.rand(n, device=dev) * (th_hi - c.target_height_range[0]).clamp(min=0.0)
+        target = torch.cat([xy, th[:, None]], dim=-1)
+        target[fixed] = self._target_local
+        self._target[env_ids] = target
         # Spawn relative to each env's own origin (previously every drone was
         # placed at world (0, 0, 0.5), i.e. all stacked on top of each other).
         root_state[:, 0:3] = self.scene.env_origins[env_ids] + local
@@ -514,7 +620,9 @@ class DroneHoverEnv(DirectRLEnv):
         self.actions[env_ids] = self.hover_motor if hasattr(self, "hover_motor") else 0.0
 
         # New random sensor/motor imperfections for this episode.
-        c = self.cfg
+        self._tof_ghost_p[env_ids] = u(*c.tof_ghost_range, n, 1)
+        self._flow_scale[env_ids] = u(*c.flow_scale_range, n, 1)
+        self._flow_drop_p[env_ids] = u(*c.flow_dropout_range, n, 1)
         self._tof_drop_p[env_ids] = u(*c.tof_net_dropout_range, n, 1)
         self._accel_bias[env_ids] = u(-c.accel_bias_range, c.accel_bias_range, n, 3)
         self._gyro_bias[env_ids] = u(-c.gyro_bias_range, c.gyro_bias_range, n, 3)

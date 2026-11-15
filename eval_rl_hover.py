@@ -27,6 +27,9 @@ parser.add_argument("--airframe", choices=["crazyflie", "dd24"], default=None,
                     help="Defaults to the airframe stored in the checkpoint.")
 parser.add_argument("--num_envs", type=int, default=512)
 parser.add_argument("--seed", type=int, default=12345, help="Different from training seeds.")
+parser.add_argument("--scenario", default="random",
+                    choices=["random", "net_only", "net_in_room", "room", "open", "fixed_net"],
+                    help="random = training mix; fixed_net = the original arena")
 parser.add_argument("--net_dropout", type=float, default=None,
                     help="Fix P(ToF misses the net) for the test, e.g. 0 or 0.7 (default: training range)")
 parser.add_argument("--out", type=str, default=None, help="JSON path (default: next to checkpoint)")
@@ -54,7 +57,13 @@ def main():
     cfg.obs_history = ck.get("obs_history", cfg.obs_history)
     if args.net_dropout is not None:
         cfg.tof_net_dropout_range = (args.net_dropout, args.net_dropout)
+    cfg.scenario = args.scenario
     cfg.__post_init__()
+    if ck.get("obs_dim") != cfg.observation_space:
+        raise SystemExit(
+            f"Checkpoint expects {ck.get('obs_dim')} inputs but this environment gives "
+            f"{cfg.observation_space}. It was trained before the current sensor set "
+            "(optical flow / scenes); evaluate it with the code it was trained with, or retrain.")
     env = DroneHoverEnv(cfg=cfg, render_mode=None)
     dev = env.device
     N = env.num_envs
@@ -78,6 +87,8 @@ def main():
     min_net = torch.full((N,), float("inf"), device=dev)
 
     obs, _ = env.reset()
+    from environments.scenes import SCENARIOS
+    scen = env._scene["scen"].clone()      # scenario of each env's first episode
     with torch.inference_mode():
         for t in range(T):
             raw = actor(obs["policy"][:, : actor.net[0].in_features])
@@ -96,7 +107,7 @@ def main():
             # envs were auto-reset, so their state belongs to a new episode).
             still = ~finished
             pos = env._local_pos()
-            err = pos - env._target_local
+            err = pos - env._target
             min_net[still] = torch.minimum(min_net[still], env._dist_to_net(pos)[still])
             if t >= window_start:
                 sum_z[still] += err[still, 2].abs()
@@ -129,6 +140,22 @@ def main():
         "train_iter": ck.get("iter"),
     }
     # Simple pass/fail so overnight runs can be skimmed quickly.
+    by = {}
+    for i, name in enumerate(SCENARIOS):
+        m = scen == i
+        if not bool(m.any()):
+            continue
+        hw = m & has_win
+        by[name] = {
+            "episodes": int(m.sum()),
+            "success_rate": survived[m].float().mean().item(),
+            "net_rate": (reason[m] == 2).float().mean().item(),
+            "crash_rate": ((reason[m] == 1) | (reason[m] == 3)).float().mean().item(),
+            "z_err_mean_m": (sum_z[hw] / n_win[hw]).mean().item() if hw.any() else None,
+            "xy_err_mean_m": (sum_xy[hw] / n_win[hw]).mean().item() if hw.any() else None,
+        }
+    res["scenario"] = args.scenario
+    res["by_scenario"] = by
     res["pass"] = bool(res["success_rate"] >= 0.95 and (res["xy_err_mean_m"] or 9) < 0.15
                        and (res["z_err_mean_m"] or 9) < 0.10)
 

@@ -128,6 +128,17 @@ python rotorpy_dd24/eval_policy.py --model runs/rotorpy_hover_1114_s0/latest.zip
 python rotorpy_dd24/visualize_policy.py --model runs/rotorpy_hover_1114_s0/latest.zip   # plot
 ```
 
+## What the policy is trained on (Isaac)
+Each episode draws a new scene (`environments/scenes.py`): the net alone, the net
+inside a room (beams that miss the net hit the walls or clutter behind it), a room
+with furniture and no net, or an open hall, plus random clutter, ghost returns,
+sensor biases and motor spread. The drone must hold the spot it started at, at a
+random target height (an input). Inputs per step: IMU, attitude, 5 ToFs, last
+motor command, optical-flow velocity (+ valid flag) and target height, stacked
+over 4 steps (88 numbers). Each run is tested three ways: `eval.json` (training
+mix, with a per-scenario breakdown), `eval_net70.json` (ToFs miss the net 70% of
+the time) and `eval_fixednet.json` (the original 3x3 m net).
+
 ## 5. Watching the policy fly (videos)
 ```bash
 sbatch oscar/record_video.sbatch                                     # seed 0, ~15-25 min

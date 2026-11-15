@@ -23,6 +23,9 @@ parser.add_argument("--airframe", choices=["crazyflie", "dd24"], default=None)
 parser.add_argument("--view", choices=["arena", "chase", "top"], default="arena")
 parser.add_argument("--seconds", type=float, default=20.0)
 parser.add_argument("--num_envs", type=int, default=1, help="Drones simulated (only env 0 is filmed)")
+parser.add_argument("--scenario", default="fixed_net",
+                    choices=["fixed_net", "random", "net_only", "net_in_room", "room", "open"],
+                    help="The drawn net matches only fixed_net; other scenes aren't drawn (yet)")
 parser.add_argument("--net_dropout", type=float, default=None,
                     help="Fix P(ToF misses the net), e.g. 0.7 for the worst case")
 parser.add_argument("--width", type=int, default=960)
@@ -61,11 +64,15 @@ def main():
     cfg.obs_history = ck.get("obs_history", cfg.obs_history)
     if args.net_dropout is not None:
         cfg.tof_net_dropout_range = (args.net_dropout, args.net_dropout)
-    cfg.show_net = True
+    cfg.scenario = args.scenario
+    cfg.show_net = args.scenario == "fixed_net"
     # Space the arenas out so neighbouring nets don't overlap in the shot.
     cfg.scene.env_spacing = max(cfg.arena_size_xy) + 1.5
     cfg.viewer = ViewerCfg(env_index=0, resolution=(args.width, args.height), **VIEWS[args.view])
     cfg.__post_init__()
+    if ck.get("obs_dim") != cfg.observation_space:
+        raise SystemExit(f"Checkpoint expects {ck.get('obs_dim')} inputs, environment gives "
+                         f"{cfg.observation_space}: it predates the current sensor set.")
 
     env = DroneHoverEnv(cfg=cfg, render_mode="rgb_array")
     dev = env.device

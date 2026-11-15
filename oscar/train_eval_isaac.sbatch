@@ -28,7 +28,7 @@ AIRFRAME="${AIRFRAME:-dd24}"
 RUN_TAG="${RUN_TAG:-${AIRFRAME}_hover}"
 RUN_DIR="runs/${RUN_TAG}_s${SEED}"
 NUM_ENVS="${NUM_ENVS:-1024}"
-ITERS="${ITERS:-3000}"
+ITERS="${ITERS:-6000}"   # harder task now (scenes + flow): ~6 h on an A5000
 STEPS="${STEPS:-128}"
 EVAL_ENVS="${EVAL_ENVS:-512}"
 RESUBMITS="${RESUBMITS:-2}"
@@ -69,5 +69,9 @@ if [ -f "$RUN_DIR/best.pt" ]; then
     ISAAC_TIMEOUT=20m isaac_exec "cd '$REPO_DIR' && '$ISAACLAB_DIR/isaaclab.sh' -p eval_rl_hover.py --headless \
         --checkpoint $RUN_DIR/best.pt --num_envs $EVAL_ENVS --net_dropout 0.7 \
         --out $RUN_DIR/eval_net70.json" || echo "WARNING: worst-case test failed or timed out"
+    # The original fixed 3x3 m net, to compare with earlier runs.
+    ISAAC_TIMEOUT=20m isaac_exec "cd '$REPO_DIR' && '$ISAACLAB_DIR/isaaclab.sh' -p eval_rl_hover.py --headless \
+        --checkpoint $RUN_DIR/best.pt --num_envs $EVAL_ENVS --scenario fixed_net \
+        --out $RUN_DIR/eval_fixednet.json" || echo "WARNING: fixed-net test failed or timed out"
 fi
 echo "== $(date) done"

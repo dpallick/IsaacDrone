@@ -24,6 +24,9 @@ parser.add_argument("--time_limit_min", type=float, default=0.0,
                     help="Stop cleanly (saving latest.pt) after this many minutes; 0 = no limit.")
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--lr", type=float, default=3e-4)
+parser.add_argument("--scenario", default="random",
+                    choices=["random", "net_only", "net_in_room", "room", "open", "fixed_net"],
+                    help="Scenes to train in (random = mix of nets, rooms, open halls)")
 parser.add_argument("--obs_mode", choices=["onboard", "privileged"], default="onboard",
                     help="onboard = only real-drone sensors (default); privileged = ground truth")
 parser.add_argument("--airframe", choices=["crazyflie", "dd24"], default="crazyflie")
@@ -69,6 +72,7 @@ def main():
     env_cfg.scene.num_envs = args.num_envs
     env_cfg.seed = args.seed
     env_cfg.obs_mode = args.obs_mode
+    env_cfg.scenario = args.scenario
     env_cfg.__post_init__()   # recompute observation sizes for the chosen mode
     env_cfg.hover_height = 1.0
 
@@ -116,6 +120,7 @@ def main():
             "critic_dim": critic_dim,
             "obs_mode": args.obs_mode,
             "obs_history": env_cfg.obs_history,
+            "scenario": args.scenario,
             "hover_motor": hover_motor,
             "residual_scale": residual_scale,
             "airframe": args.airframe,
