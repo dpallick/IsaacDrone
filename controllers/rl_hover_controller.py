@@ -30,9 +30,11 @@ class RLHoverController:
         obs_dim = 16
         self.control_mode = "motors"
         state = None
+        ck = {}
 
         if checkpoint is not None:
             state = torch.load(checkpoint, map_location=device, weights_only=False)
+            ck = state if isinstance(state, dict) else {}
             if "actor" in state:
                 self.control_mode = state.get("control_mode", "motors")
                 self.hover_motor = state.get("hover_motor", self.hover_motor)
@@ -45,13 +47,15 @@ class RLHoverController:
         self.policy.eval()
         if state is not None:
             self.policy.load_state_dict(state)
+        from controllers.obs_norm import load_obs_norm
+        self.norm = load_obs_norm(ck, obs_dim, device)
 
     def reset(self, num_envs):
         pass
 
     def act(self, obs):
         with torch.no_grad():
-            residual_raw = self.policy(obs[:, : self.obs_dim])
+            residual_raw = self.policy(self.norm(obs[:, : self.obs_dim]))
 
         if self.control_mode == "ctbr":
             return torch.clamp(residual_raw, 0.0, 1.0)   # env maps to thrust + body rates

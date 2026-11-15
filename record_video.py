@@ -81,6 +81,8 @@ def main():
     actor = RLHoverActor(obs_dim=ck.get("obs_dim", 14), action_dim=4).to(dev)
     actor.load_state_dict(ck["actor"])
     actor.eval()
+    from controllers.obs_norm import load_obs_norm
+    norm = load_obs_norm(ck, actor.net[0].in_features, dev)
     hover = ck.get("hover_motor", env.hover_motor)
     rscale = ck.get("residual_scale", 0.15)
     n_in = actor.net[0].in_features
@@ -98,7 +100,7 @@ def main():
     obs, _ = env.reset()
     with torch.inference_mode():
         for t in range(steps + warmup):
-            raw = actor(obs["policy"][:, :n_in])
+            raw = actor(norm(obs["policy"][:, :n_in]))
             if cfg.control_mode == "ctbr":
                 actions = raw.clamp(0.0, 1.0)
             else:

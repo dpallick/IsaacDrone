@@ -11,8 +11,14 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--num_envs", type=int, default=256)
 parser.add_argument("--iters", type=int, default=2000)
 parser.add_argument("--steps", type=int, default=128)
-parser.add_argument("--epochs", type=int, default=4)
-parser.add_argument("--minibatch_size", type=int, default=1024)
+parser.add_argument("--epochs", type=int, default=5)
+parser.add_argument("--num_minibatches", type=int, default=4,
+                    help="Minibatches per epoch (rsl_rl / Isaac Lab default 4). With 1024 envs x 128 "
+                         "steps that's 32768 samples each and 20 updates per iteration, the regime the "
+                         "adaptive-KL schedule is designed for.")
+parser.add_argument("--minibatch_size", type=int, default=0,
+                    help="Fixed minibatch size instead of --num_minibatches (0 = use num_minibatches). "
+                         "The old default 1024 meant ~512 updates/iteration and collapsed the adaptive lr.")
 parser.add_argument("--save_path", type=str, default=None,
                     help="Optional extra copy of the best checkpoint (old behaviour).")
 parser.add_argument("--run_dir", type=str, default="runs/hover",
@@ -23,13 +29,17 @@ parser.add_argument("--save_every", type=int, default=25, help="Write latest.pt 
 parser.add_argument("--time_limit_min", type=float, default=0.0,
                     help="Stop cleanly (saving latest.pt) after this many minutes; 0 = no limit.")
 parser.add_argument("--seed", type=int, default=0)
-parser.add_argument("--lr", type=float, default=3e-4, help="Initial learning rate")
+parser.add_argument("--lr", type=float, default=1e-4, help="Initial learning rate (the adaptive schedule takes over)")
 parser.add_argument("--lr_schedule", choices=["adaptive", "linear", "constant"], default="adaptive",
                     help="adaptive: adjust every minibatch to keep the policy step near --desired_kl "
                          "(as rsl_rl / Isaac Lab do); linear: decay to 5%% of --lr by the last iter")
 parser.add_argument("--desired_kl", type=float, default=0.01)
+parser.add_argument("--init_log_std", type=float, default=-1.6,
+                    help="Initial exploration noise (log std of the [0,1] action). -1.6 = std 0.2 "
+                         "(about +-0.4 in a: +-1 rad/s rate noise). Much smaller makes the KL "
+                         "hypersensitive and the adaptive lr collapses.")
 parser.add_argument("--lr_min", type=float, default=1e-5)
-parser.add_argument("--lr_max", type=float, default=1e-3)
+parser.add_argument("--lr_max", type=float, default=1e-2)
 parser.add_argument("--scenario", default="random",
                     choices=["random", "net_only", "net_in_room", "room", "open", "fixed_net"],
                     help="Scenes to train in (random = mix of nets, rooms, open halls)")
@@ -53,6 +63,7 @@ import torch.optim as optim
 
 from environments.drone_hover_env import DroneHoverEnv, DroneHoverEnvCfg, DroneHoverEnvCfgDD24
 from controllers.rl_hover_controller import RLHoverActor
+from controllers.obs_norm import RunningNorm
 
 
 class Critic(nn.Module):
@@ -97,8 +108,11 @@ def main():
 
     actor = RLHoverActor(obs_dim=obs_dim, action_dim=4).to(device)
     critic = Critic(obs_dim=critic_dim).to(device)
+    # Running input normalisation (saved in the checkpoint, frozen at deployment).
+    actor_norm = RunningNorm(obs_dim).to(device)
+    critic_norm = RunningNorm(critic_dim).to(device)
 
-    log_std = nn.Parameter(torch.ones(4, device=device) * -2.5)
+    log_std = nn.Parameter(torch.ones(4, device=device) * args.init_log_std)
 
     optimizer = optim.Adam(
         list(actor.parameters()) + list(critic.parameters()) + [log_std],
@@ -120,6 +134,8 @@ def main():
     def checkpoint(it, best_reward):
         return {
             "actor": actor.state_dict(),
+            "obs_norm": actor_norm.to_dict(),
+            "critic_norm": critic_norm.to_dict(),
             "critic": critic.state_dict(),
             "log_std": log_std.detach().cpu(),
             "optimizer": optimizer.state_dict(),
@@ -155,9 +171,12 @@ def main():
     start_it = 0
     best_reward = -1e9
     if args.resume and os.path.isfile(latest_path):
-        ck = torch.load(latest_path, map_location=device)
+        ck = torch.load(latest_path, map_location=device, weights_only=False)
         actor.load_state_dict(ck["actor"])
         critic.load_state_dict(ck["critic"])
+        if "obs_norm" in ck:
+            actor_norm.load_dict(ck["obs_norm"])
+            critic_norm.load_dict(ck["critic_norm"])
         with torch.no_grad():
             log_std.copy_(ck["log_std"].to(device))
         optimizer.load_state_dict(ck["optimizer"])
@@ -189,8 +208,13 @@ def main():
         n_net = torch.zeros((), device=device)
 
         for _ in range(args.steps):
-            policy_obs = obs["policy"]
-            obs_prev = obs
+            # Update the running statistics with this step's inputs, then feed the
+            # networks normalised inputs (stored normalised, so PPO's old/new
+            # log-probs use identical inputs).
+            actor_norm.update(obs["policy"])
+            critic_norm.update(critic_in(obs))
+            policy_obs = actor_norm(obs["policy"])
+            crit_obs = critic_norm(critic_in(obs))
 
             with torch.no_grad():
                 mean = actor(policy_obs)
@@ -200,7 +224,7 @@ def main():
                 action_raw = dist.sample()
                 action_raw_clamped = torch.clamp(action_raw, 0.0, 1.0)
                 logprob = dist.log_prob(action_raw).sum(dim=-1)
-                value = critic(critic_in(obs))
+                value = critic(crit_obs)
 
                 if args.control_mode == "ctbr":
                     actions = action_raw_clamped          # env maps it to thrust + body rates
@@ -216,7 +240,7 @@ def main():
             done = terminated | truncated
 
             obs_buf.append(policy_obs)
-            crit_buf.append(critic_in(obs_prev))
+            crit_buf.append(crit_obs)
             action_raw_buf.append(action_raw)
             logprob_buf.append(logprob)
             reward_buf.append(reward)
@@ -231,7 +255,7 @@ def main():
             n_net += env.term_net.float().sum()
 
         with torch.no_grad():
-            next_value = critic(critic_in(obs))
+            next_value = critic(critic_norm(critic_in(obs)))
 
         obs_buf = torch.stack(obs_buf)
         crit_buf = torch.stack(crit_buf)
@@ -267,6 +291,7 @@ def main():
         b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
 
         batch_size = b_obs.shape[0]
+        mb_size = args.minibatch_size or max(batch_size // args.num_minibatches, 1)
         indices = torch.arange(batch_size, device=device)
 
         if args.lr_schedule == "linear":
@@ -278,8 +303,8 @@ def main():
         for _ in range(args.epochs):
             perm = indices[torch.randperm(batch_size, device=device)]
 
-            for start in range(0, batch_size, args.minibatch_size):
-                mb_idx = perm[start:start + args.minibatch_size]
+            for start in range(0, batch_size, mb_size):
+                mb_idx = perm[start:start + mb_size]
 
                 mean = actor(b_obs[mb_idx])
                 std = torch.exp(log_std).expand_as(mean)

@@ -105,6 +105,12 @@ tail -n 30 oscar/logs/isaac_hover_*_0.out
 mean horizontal error under 15 cm, and (Isaac) mean height error under 10 cm.
 These thresholds live in the eval scripts.
 
+### Training settings (why)
+* Inputs are normalised with running mean/std (saved in the checkpoint).
+* 4 minibatches x 5 epochs per iteration (20 updates), as in Isaac Lab's rsl_rl.
+* Initial action noise log_std = -1.6. Together these keep the adaptive learning
+  rate in a useful range; without them it collapsed to 1e-5 in the first smoke test.
+
 ### Learning rate
 Training uses an **adaptive** schedule by default: after every minibatch the
 learning rate is lowered if the policy just moved too far (KL > 0.02) and raised if

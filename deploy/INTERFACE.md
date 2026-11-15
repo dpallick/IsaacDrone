@@ -31,6 +31,13 @@ first tick, fill all 8 with the first frame.
 
 ToF positions/directions are in `environments/dd24_params.py` (`DD24_TOF_SENSORS`).
 
+## Normalisation (inside the checkpoint)
+Before the actor, every one of the 176 inputs is normalised with statistics saved
+in the checkpoint (`ck["obs_norm"]`, frozen after training):
+`x_n = clamp((x - mean) / max(sqrt(var), 0.01), -10, 10)`.
+Build the raw vector exactly as above; `controllers/obs_norm.load_obs_norm(ck, 176, device)`
+returns the function to apply. Never re-estimate these on the drone.
+
 ## Output: 4 numbers -> `mavros_msgs/AttitudeTarget` on `/mavros/setpoint_raw/attitude`
 The actor outputs s in [0,1]^4 (sigmoid). Then a = 2s - 1 and:
 * `thrust` = clamp(0.27 + 0.20 * a0, 0, 1)   (`ctbr_thrust_center`, `ctbr_thrust_span`)
