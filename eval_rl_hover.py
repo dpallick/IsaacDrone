@@ -30,6 +30,9 @@ parser.add_argument("--seed", type=int, default=12345, help="Different from trai
 parser.add_argument("--scenario", default="random",
                     choices=["random", "net_only", "net_in_room", "room", "open", "fixed_net"],
                     help="random = training mix; fixed_net = the original arena")
+parser.add_argument("--lag", action="store_true",
+                    help="Worst-case laggy links: max latencies, 15%% ToF/flow drops, 10%% lost "
+                         "setpoints, frequent stalls (top of every training range)")
 parser.add_argument("--net_dropout", type=float, default=None,
                     help="Fix P(ToF misses the net) for the test, e.g. 0 or 0.7 (default: training range)")
 parser.add_argument("--out", type=str, default=None, help="JSON path (default: next to checkpoint)")
@@ -60,6 +63,14 @@ def main():
     if args.net_dropout is not None:
         cfg.tof_net_dropout_range = (args.net_dropout, args.net_dropout)
     cfg.scenario = args.scenario
+    if args.lag:
+        top = lambda r: (r[1], r[1])  # noqa: E731
+        for name in ["imu_latency_s_range", "tof_latency_s_range", "flow_latency_s_range", "cmd_latency_s_range",
+                     "sensor_drop_prob_range", "imu_drop_prob_range", "cmd_drop_prob_range",
+                     "sensor_stall_rate_range", "imu_stall_rate_range", "cmd_stall_rate_range"]:
+            setattr(cfg, name, top(getattr(cfg, name)))
+        cfg.tof_rate_hz_range = (cfg.tof_rate_hz_range[0],) * 2
+        cfg.flow_rate_hz_range = (cfg.flow_rate_hz_range[0],) * 2
     cfg.__post_init__()
     if ck.get("obs_dim") != cfg.observation_space:
         raise SystemExit(
@@ -162,6 +173,7 @@ def main():
             "xy_err_mean_m": (sum_xy[hw] / n_win[hw]).mean().item() if hw.any() else None,
         }
     res["scenario"] = args.scenario
+    res["lag_worst_case"] = bool(args.lag)
     res["by_scenario"] = by
     res["pass"] = bool(res["success_rate"] >= 0.95 and (res["xy_err_mean_m"] or 9) < 0.15
                        and (res["z_err_mean_m"] or 9) < 0.10)

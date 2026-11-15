@@ -73,5 +73,9 @@ if [ -f "$RUN_DIR/best.pt" ]; then
     ISAAC_TIMEOUT=20m isaac_exec "cd '$REPO_DIR' && '$ISAACLAB_DIR/isaaclab.sh' -p eval_rl_hover.py --headless \
         --checkpoint $RUN_DIR/best.pt --num_envs $EVAL_ENVS --scenario fixed_net \
         --out $RUN_DIR/eval_fixednet.json" || echo "WARNING: fixed-net test failed or timed out"
+    # Worst-case laggy links (max latency, dropped messages and setpoints, stalls).
+    ISAAC_TIMEOUT=20m isaac_exec "cd '$REPO_DIR' && '$ISAACLAB_DIR/isaaclab.sh' -p eval_rl_hover.py --headless \
+        --checkpoint $RUN_DIR/best.pt --num_envs $EVAL_ENVS --lag \
+        --out $RUN_DIR/eval_lag.json" || echo "WARNING: laggy-link test failed or timed out"
 fi
 echo "== $(date) done"

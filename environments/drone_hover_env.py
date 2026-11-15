@@ -127,6 +127,17 @@ class DroneHoverEnvCfg(DirectRLEnvCfg):
     tof_rate_hz_range = (18.0, 22.0)       # 20 Hz ToFs
     tof_latency_s_range = (0.03, 0.06)
 
+    # ---- Laggy links (per episode). Drops: P(an update is lost); stalls: rate of
+    # 0.1-0.4 s freezes per second. Ranges start at 0, so calm episodes stay common.
+    sensor_drop_prob_range = (0.0, 0.15)   # ToF / flow updates lost
+    imu_drop_prob_range = (0.0, 0.05)      # /mavros/imu/data messages lost
+    sensor_stall_rate_range = (0.0, 0.2)   # ToF / flow freezes per second
+    imu_stall_rate_range = (0.0, 0.05)
+    # Command link: node -> MAVROS -> serial -> PX4 (+ Pi compute time).
+    cmd_latency_s_range = (0.0, 0.04)
+    cmd_drop_prob_range = (0.0, 0.10)      # setpoint lost: PX4 keeps flying the last one
+    cmd_stall_rate_range = (0.0, 0.05)
+
     hover_height = 1.0
     crash_height = A.CRASH_HEIGHT
     # Perpendicular lever arm used by the mixer below (NOT center-to-motor for an
@@ -351,6 +362,9 @@ class DroneHoverEnv(DirectRLEnv):
         self._imu_s = HeldSensor(N, 9, 3, self.device)        # accel, gyro, gravity dir
         self._tof_s = HeldSensor(N, S, 6, self.device)
         self._flow_s = HeldSensor(N, 3, 8, self.device)
+        # Command link to PX4: what PX4 actually flies (delayed / dropped / stalled).
+        self._cmd_link = HeldSensor(N, 4, 3, self.device)
+        self._cmd_px4 = torch.zeros(N, 4, device=self.device)
         # Thrust/body-rate command (a in [-1,1]^4) and the simulated PX4 below it.
         self._cmd = torch.zeros(N, 4, device=self.device)
         self._cmd_prev = torch.zeros(N, 4, device=self.device)
@@ -430,6 +444,9 @@ class DroneHoverEnv(DirectRLEnv):
             # node would publish. Held for the 4 physics steps until the next policy step.
             self._cmd_prev = self._cmd.clone()
             self._cmd = 2.0 * torch.clamp(actions.clone(), 0.0, 1.0) - 1.0
+            # The policy (and its 'previous command' input) knows what it SENT; PX4
+            # flies what ARRIVES through the link.
+            self._cmd_px4 = self._cmd_link(self._cmd, self.cfg.sim.dt * self.cfg.decimation)
             return
         self.actions = torch.clamp(actions.clone(), 0.0, 1.0)
         self._set_wrench(self.actions * self.max_motor_thrust * self._thrust_scale)
@@ -458,7 +475,7 @@ class DroneHoverEnv(DirectRLEnv):
     def _apply_action(self):
         if self.cfg.control_mode == "ctbr":
             # One tick of the simulated PX4 rate controller (runs every physics step).
-            thrust, rates = self.ctbr_setpoint(self._cmd)
+            thrust, rates = self.ctbr_setpoint(self._cmd_px4)
             gyro = self.drone.data.root_ang_vel_b + self._gyro_bias \
                 + torch.randn_like(self._gyro_bias) * self.cfg.gyro_noise_std
             frac = self._px4.step(rates, thrust, gyro, self.cfg.sim.dt)
@@ -721,9 +738,16 @@ class DroneHoverEnv(DirectRLEnv):
         self._flow_drop_p[env_ids] = u(*c.flow_dropout_range, n, 1)
         step_dt = c.sim.dt * c.decimation
         steps = lambda rng: torch.round(u(*rng, n) / step_dt).long()   # noqa: E731
-        self._imu_s.reset(env_ids, u(*c.imu_rate_hz_range, n), steps(c.imu_latency_s_range))
-        self._tof_s.reset(env_ids, u(*c.tof_rate_hz_range, n), steps(c.tof_latency_s_range))
-        self._flow_s.reset(env_ids, u(*c.flow_rate_hz_range, n), steps(c.flow_latency_s_range))
+        self._imu_s.reset(env_ids, u(*c.imu_rate_hz_range, n), steps(c.imu_latency_s_range),
+                          u(*c.imu_drop_prob_range, n), u(*c.imu_stall_rate_range, n))
+        self._tof_s.reset(env_ids, u(*c.tof_rate_hz_range, n), steps(c.tof_latency_s_range),
+                          u(*c.sensor_drop_prob_range, n), u(*c.sensor_stall_rate_range, n))
+        self._flow_s.reset(env_ids, u(*c.flow_rate_hz_range, n), steps(c.flow_latency_s_range),
+                           u(*c.sensor_drop_prob_range, n), u(*c.sensor_stall_rate_range, n))
+        # rate 1000 Hz: a setpoint is due every policy step (unless dropped / stalled)
+        self._cmd_link.reset(env_ids, torch.full((n,), 1000.0, device=dev), steps(c.cmd_latency_s_range),
+                             u(*c.cmd_drop_prob_range, n), u(*c.cmd_stall_rate_range, n))
+        self._cmd_px4[env_ids] = 0.0
         # PX4 model mismatch for this episode; start the motors near hover, and the
         # held command at "hover thrust, zero rates" so the first steps are calm.
         k = u(*c.thrust_curve_k_range, n, 1)
