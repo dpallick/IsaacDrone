@@ -128,6 +128,18 @@ python rotorpy_dd24/eval_policy.py --model runs/rotorpy_hover_1114_s0/latest.zip
 python rotorpy_dd24/visualize_policy.py --model runs/rotorpy_hover_1114_s0/latest.zip   # plot
 ```
 
+## 5. Watching the policy fly (videos)
+```bash
+sbatch oscar/record_video.sbatch                                     # seed 0, ~15-25 min
+CKPT=runs/dd24_hover_1115_s1/best.pt sbatch oscar/record_video.sbatch  # another run
+```
+Writes `arena.mp4`, `chase.mp4`, `top.mp4` and `arena_net70.mp4` (the ToFs miss the
+net 70% of the time) into `<run>/videos/`. The net is drawn as a strand grid and
+the hover target as a red dot. Copy them to your Mac:
+```bash
+scp -r YOURID@ssh.ccv.brown.edu:~/IsaacDrone/runs/dd24_hover_1115_s0/videos ~/Downloads/
+```
+
 ## Recommended first run
 Before the first overnight batch, run a short Isaac smoke test:
 `ITERS=30 WALL_MIN=40 RESUBMITS=0 sbatch --time=00:40:00 oscar/train_eval_isaac.sbatch`.

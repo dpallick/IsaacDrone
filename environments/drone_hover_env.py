@@ -147,6 +147,9 @@ class DroneHoverEnvCfg(DirectRLEnvCfg):
     net_margin = A.NET_MARGIN
     net_warn_band = A.NET_WARN_BAND
     max_tilt_rad = 1.2           # terminate if tilted beyond this (~70 deg)
+    # Draw the net (0.5 m strand grid) and the hover target in the scene. Purely
+    # visual, no collisions; only used for videos (record_video.py), off in training.
+    show_net = False
 
     # Spawn distribution (relative to env origin). Randomised so the policy has to
     # actively correct xy drift instead of only ever seeing a perfect start.
@@ -196,8 +199,9 @@ class DroneHoverEnvCfgDD24(DroneHoverEnvCfg):
     arm_length = DD24.arm_length_m / math.sqrt(2.0)
     max_thrust_to_weight = DD24.thrust_to_weight
     yaw_coeff = DD24.yaw_coeff
-    # URDF-imported props are links named m{i}_prop; spin the link's visuals.
-    prop_visual_paths = ("m1_prop", "m2_prop", "m3_prop", "m4_prop")
+    # URDF props are articulation links that already spin on their free joints, so
+    # no xform-based spinning (editing a physics link's transform fights PhysX).
+    prop_visual_paths = ()
     # Five ToFs at their CAD positions (see dd24_params.DD24_TOF_SENSORS).
     tof_sensors = DD24_TOF_SENSORS
 
@@ -275,6 +279,9 @@ class DroneHoverEnv(DirectRLEnv):
         self.imu = Imu(self.cfg.imu)
         self.scene.sensors["imu"] = self.imu
 
+        if self.cfg.show_net:
+            self._spawn_net_visual("/World/envs/env_0")
+
         self.cfg.terrain.num_envs = self.scene.cfg.num_envs
         self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
         self.terrain = self.cfg.terrain.class_type(self.cfg.terrain)
@@ -285,6 +292,35 @@ class DroneHoverEnv(DirectRLEnv):
 
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0)
         light_cfg.func("/World/Light", light_cfg)
+
+    def _spawn_net_visual(self, env_prim: str, spacing: float = 0.5, strand: float = 0.008):
+        """Net as a grid of thin dark strands on the 4 walls (+ ceiling) and a red
+        marker at the hover point. Visual only (no collision props), spawned in
+        env_0 before cloning so every env gets a copy."""
+        hx, hy = self.cfg.arena_size_xy[0] / 2.0, self.cfg.arena_size_xy[1] / 2.0
+        H = self.cfg.arena_height if self.cfg.arena_height > 0 else 2.5
+        strand_mat = sim_utils.PreviewSurfaceCfg(diffuse_color=(0.12, 0.12, 0.12))
+        bars = []
+
+        def ticks(lo, hi):
+            n = max(int(round((hi - lo) / spacing)), 1)
+            return [lo + (hi - lo) * k / n for k in range(n + 1)]
+
+        for sx in (-1, 1):   # walls at x = +-hx
+            bars += [((strand, strand, H), (sx * hx, y, H / 2)) for y in ticks(-hy, hy)]
+            bars += [((strand, 2 * hy, strand), (sx * hx, 0.0, z)) for z in ticks(0.0, H)]
+        for sy in (-1, 1):   # walls at y = +-hy
+            bars += [((strand, strand, H), (x, sy * hy, H / 2)) for x in ticks(-hx, hx)]
+            bars += [((2 * hx, strand, strand), (0.0, sy * hy, z)) for z in ticks(0.0, H)]
+        if self.cfg.arena_height > 0:   # ceiling grid
+            bars += [((strand, 2 * hy, strand), (x, 0.0, H)) for x in ticks(-hx, hx)]
+            bars += [((2 * hx, strand, strand), (0.0, y, H)) for y in ticks(-hy, hy)]
+        for i, (size, pos) in enumerate(bars):
+            cfg = sim_utils.CuboidCfg(size=size, visual_material=strand_mat)
+            cfg.func(f"{env_prim}/Net/strand_{i}", cfg, translation=pos)
+        target = sim_utils.SphereCfg(
+            radius=0.03, visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.9, 0.1, 0.1)))
+        target.func(f"{env_prim}/Net/hover_target", target, translation=(0.0, 0.0, self.cfg.hover_height))
 
     # ---------------------------------------------------------------- actions
     def _pre_physics_step(self, actions: torch.Tensor):
