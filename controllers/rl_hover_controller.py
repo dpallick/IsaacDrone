@@ -24,26 +24,32 @@ RLHoverPolicy = RLHoverActor
 class RLHoverController:
     def __init__(self, device="cuda:0", checkpoint=None):
         self.device = device
+        # Defaults match the old Crazyflie setup; new checkpoints carry their own.
         self.hover_motor = 1.0 / 2.2
         self.residual_scale = 0.15
-
-        self.policy = RLHoverActor().to(device)
-        self.policy.eval()
+        obs_dim = 16
+        state = None
 
         if checkpoint is not None:
             state = torch.load(checkpoint, map_location=device)
-
             if "actor" in state:
-                self.policy.load_state_dict(state["actor"])
-            else:
-                self.policy.load_state_dict(state)
+                self.hover_motor = state.get("hover_motor", self.hover_motor)
+                self.residual_scale = state.get("residual_scale", self.residual_scale)
+                obs_dim = state.get("obs_dim", 14)
+                state = state["actor"]
+
+        self.obs_dim = obs_dim
+        self.policy = RLHoverActor(obs_dim=obs_dim).to(device)
+        self.policy.eval()
+        if state is not None:
+            self.policy.load_state_dict(state)
 
     def reset(self, num_envs):
         pass
 
     def act(self, obs):
         with torch.no_grad():
-            residual_raw = self.policy(obs)
+            residual_raw = self.policy(obs[:, : self.obs_dim])
 
         residual = (residual_raw - 0.5) * self.residual_scale
         actions = self.hover_motor + residual
