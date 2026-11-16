@@ -40,6 +40,9 @@ parser.add_argument("--init_log_std", type=float, default=-1.6,
                          "hypersensitive and the adaptive lr collapses.")
 parser.add_argument("--lr_min", type=float, default=1e-5)
 parser.add_argument("--lr_max", type=float, default=1e-3)
+parser.add_argument("--reward", default="v1", help="Reward preset: v1 (original) or calm (see REWARD_PRESETS)")
+parser.add_argument("--gamma", type=float, default=0.99,
+                    help="Discount: 0.99 looks ~2 s ahead at 50 Hz, 0.995 ~4 s (use with --reward calm)")
 parser.add_argument("--lr_max_final", type=float, default=None,
                     help="Decay the learning-rate ceiling from --lr_max to this over the run "
                          "(geometric). Lets the adaptive rule polish at the end instead of "
@@ -99,6 +102,10 @@ def main():
     env_cfg.scene.num_envs = args.num_envs
     env_cfg.seed = args.seed
     env_cfg.obs_mode = args.obs_mode
+    from environments.drone_hover_env import apply_reward_preset
+    apply_reward_preset(env_cfg, args.reward)
+    print(f"reward preset {args.reward}: crash {env_cfg.rew_crash} hvel {env_cfg.rew_hvel} "
+          f"action_rate {env_cfg.rew_action_rate} tilt {env_cfg.rew_tilt}; gamma {args.gamma}")
     env_cfg.scenario = args.scenario
     env_cfg.control_mode = args.control_mode
     env_cfg.__post_init__()   # recompute observation sizes for the chosen mode
@@ -132,7 +139,7 @@ def main():
         lr=args.lr,
     )
 
-    gamma = 0.99
+    gamma = args.gamma
     gae_lambda = 0.95
     clip_eps = 0.2
     value_coef = 0.5
@@ -163,6 +170,8 @@ def main():
             "control_mode": args.control_mode,
             "ctbr_thrust_center": env_cfg.ctbr_thrust_center,
             "accel_clip": getattr(env_cfg, "accel_clip", None),
+            "reward_preset": args.reward,
+            "gamma": args.gamma,
             "ctbr_thrust_span": env_cfg.ctbr_thrust_span,
             "ctbr_max_rates": list(env_cfg.ctbr_max_rates),
             "policy_hz": 1.0 / (env_cfg.sim.dt * env_cfg.decimation),

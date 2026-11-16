@@ -263,6 +263,9 @@ class DroneHoverEnvCfg(DirectRLEnvCfg):
     rew_action_rate = 0.05     # change in command between steps (smooth = deployable)
     rew_net = 2.0
     rew_crash = 10.0
+    rew_hvel = 0.0             # extra penalty on horizontal speed (calm drift damping)
+    rew_tilt = 0.0             # penalty on tilt^2 (rad^2): stay near level, far from flips
+    reward_preset = "v1"       # see REWARD_PRESETS / apply_reward_preset
 
 
     def __post_init__(self):
@@ -305,6 +308,30 @@ class DroneHoverEnvCfgDD24(DroneHoverEnvCfg):
         # Imported lazily so the Crazyflie config works before the DD24 USD exists.
         from assets.dd24.dd24_cfg import DD24_CFG
         self.robot = DD24_CFG.replace(prim_path="/World/envs/env_.*/Drone")
+
+
+# Reward variants (train_rl_hover.py --reward). "v1" = the original weights.
+# "calm": the fine-tune showed v1 rates "drift less, crash more" as an improvement:
+# crashes were cheap (10) next to the immediate position reward, and nothing
+# discouraged the aggressive, saturating control that turns a short link freeze into
+# a crash. calm makes losing the drone expensive, damps drift through horizontal
+# velocity instead of chasing position, and rewards smooth, near-level flight.
+# Use it with --gamma 0.995 (look ~4 s ahead instead of ~2 s).
+REWARD_PRESETS = {
+    "v1": {},
+    "calm": dict(rew_crash=40.0, rew_hvel=0.4, rew_action_rate=0.2, rew_action=0.05, rew_tilt=0.5),
+}
+
+
+def apply_reward_preset(cfg, name: str):
+    if name not in REWARD_PRESETS:
+        raise ValueError(f"unknown reward preset {name!r}; choose from {list(REWARD_PRESETS)}")
+    for k, v in REWARD_PRESETS[name].items():
+        if not hasattr(cfg, k):
+            raise AttributeError(k)
+        setattr(cfg, k, v)
+    cfg.reward_preset = name
+    return cfg
 
 
 class DroneHoverEnv(DirectRLEnv):
@@ -670,11 +697,14 @@ class DroneHoverEnv(DirectRLEnv):
             1.0,
         ) ** 2
 
+        tilt = torch.acos(torch.clamp(-data.projected_gravity_b[:, 2], -1.0, 1.0))
         reward = (
             self.cfg.rew_alive
             - self.cfg.rew_z * err[:, 2].abs()
             - self.cfg.rew_xy * torch.linalg.norm(err[:, 0:2], dim=-1)
             - self.cfg.rew_lin_vel * torch.linalg.norm(data.root_lin_vel_w, dim=-1)
+            - self.cfg.rew_hvel * torch.linalg.norm(data.root_lin_vel_w[:, 0:2], dim=-1)
+            - self.cfg.rew_tilt * tilt ** 2
             - self.cfg.rew_ang_vel * torch.linalg.norm(data.root_ang_vel_b, dim=-1)
             - self._action_penalty()
             - self.cfg.rew_net * net_pen

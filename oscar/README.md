@@ -99,6 +99,16 @@ mean success over the four tests), then fine-tunes it for 1500 iterations from i
 `--lr_max_final`) and tests the result. Compare everything with
 `python3 oscar/pick_best.py runs/${RUN}_s0 runs/${RUN}_s1 runs/${RUN}_ft_s*`.
 
+### Compare two training variants (A/B)
+```bash
+ITERS=2000 MAIL_USER=you@brown.edu bash oscar/ab_test.sh
+```
+Smoke test first (calm reward), then on one GPU each: A = original reward (`--reward v1
+--gamma 0.99`), B = calm reward (`--reward calm --gamma 0.995`: crash 40, horizontal-speed,
+tilt and smoothness penalties, ~4 s look-ahead). Both include the accelerometer fix.
+Compare with `pick_best.py` and the flight recorder. Any run can use
+`EXTRA="--reward calm --gamma 0.995"`.
+
 ### Why and when does it fail? (flight recorder)
 ```bash
 CKPT=runs/dd24_hover_1115_1834_s0/best.pt sbatch oscar/flight_recorder.sbatch
