@@ -23,8 +23,9 @@ cd "$REPO_DIR"
 [ -f "$CKPT" ] || { echo "No checkpoint at $CKPT"; exit 1; }
 SCENARIO="${SCENARIO:-random}"; LAG="${LAG:-0}"; NUM_ENVS="${NUM_ENVS:-512}"
 FAILS="${FAILS:-12}"; DRIFTS="${DRIFTS:-4}"
-OUT="$(dirname "$CKPT")/flights_${SCENARIO}$([ "$LAG" = 1 ] && echo _lag)"
-LAGARG=""; [ "$LAG" = 1 ] && LAGARG="--lag"
+OUT="$(dirname "$CKPT")/flights_${SCENARIO}"
+LAGARG=""
+if [ "$LAG" = 1 ]; then OUT="${OUT}_lag"; LAGARG="--lag"; fi
 mkdir -p "$OUT"
 echo "== $(date) $CKPT scenario=$SCENARIO lag=$LAG -> $OUT"
 
