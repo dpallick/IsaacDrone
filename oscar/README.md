@@ -88,6 +88,17 @@ learning rate not pinned, KL sane) and only then launches the long Isaac run.
 1024 envs: 10000 iterations = ~12.5 h per seed (one automatic resubmit), two seeds
 at a time on a free account.
 
+### Test the best checkpoints and fine-tune (after a run plateaus)
+```bash
+scancel <training job id>          # policies are already saved in each seed's best.pt
+RUN=dd24_hover_1115_1834 MAIL_USER=you@brown.edu bash oscar/finetune_tonight.sh
+```
+Tests every seed's `best.pt` (four tests), picks the best seed (`oscar/pick_best.py`:
+mean success over the four tests), then fine-tunes it for 1500 iterations from its
+`best.pt` with the learning-rate ceiling decaying 3e-4 -> 1e-5 (`--init_from`,
+`--lr_max_final`) and tests the result. Compare everything with
+`python3 oscar/pick_best.py runs/${RUN}_s0 runs/${RUN}_s1 runs/${RUN}_ft_s*`.
+
 ### Submit everything before you leave
 ```bash
 cd ~/IsaacDrone && git pull

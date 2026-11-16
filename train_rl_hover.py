@@ -40,6 +40,14 @@ parser.add_argument("--init_log_std", type=float, default=-1.6,
                          "hypersensitive and the adaptive lr collapses.")
 parser.add_argument("--lr_min", type=float, default=1e-5)
 parser.add_argument("--lr_max", type=float, default=1e-3)
+parser.add_argument("--lr_max_final", type=float, default=None,
+                    help="Decay the learning-rate ceiling from --lr_max to this over the run "
+                         "(geometric). Lets the adaptive rule polish at the end instead of "
+                         "pushing at full strength forever. Off by default.")
+parser.add_argument("--init_from", type=str, default=None,
+                    help="Fine-tune: start from this checkpoint's weights, input normalisation and "
+                         "action noise (fresh optimizer, iteration 0). Ignored when --resume finds "
+                         "latest.pt in run_dir, so a resubmitted fine-tune continues itself.")
 parser.add_argument("--scenario", default="random",
                     choices=["random", "net_only", "net_in_room", "room", "open", "fixed_net"],
                     help="Scenes to train in (random = mix of nets, rooms, open halls)")
@@ -184,6 +192,20 @@ def main():
         start_it = ck["iter"] + 1
         best_reward = ck["best_reward"]
         print(f"Resumed from {latest_path} at iter {start_it} (best reward {best_reward:.4f})")
+    elif args.init_from:
+        ck = torch.load(args.init_from, map_location=device, weights_only=False)
+        if ck.get("obs_dim", obs_dim) != obs_dim:
+            raise SystemExit(f"--init_from {args.init_from}: obs_dim {ck.get('obs_dim')} != env {obs_dim}")
+        if ck.get("actor_out", "sigmoid") != "linear":
+            raise SystemExit(f"--init_from {args.init_from}: old sigmoid-output checkpoint, can't fine-tune")
+        actor.load_state_dict(ck["actor"])
+        critic.load_state_dict(ck["critic"])
+        actor_norm.load_dict(ck["obs_norm"])
+        critic_norm.load_dict(ck["critic_norm"])
+        with torch.no_grad():
+            log_std.copy_(ck["log_std"].to(device))
+        print(f"Fine-tuning from {args.init_from} (its iter {ck.get('iter')}, best reward "
+              f"{ck.get('best_reward')}); log_std {log_std.data.tolist()}")
 
     new_csv = not os.path.isfile(csv_path) or start_it == 0
     csv_file = open(csv_path, "w" if new_csv else "a", newline="")
@@ -295,6 +317,12 @@ def main():
         mb_size = args.minibatch_size or max(batch_size // args.num_minibatches, 1)
         indices = torch.arange(batch_size, device=device)
 
+        if args.lr_max_final is not None:
+            lr_cap = args.lr_max * (args.lr_max_final / args.lr_max) ** min(it / max(args.iters - 1, 1), 1.0)
+        else:
+            lr_cap = args.lr_max
+        for g in optimizer.param_groups:
+            g["lr"] = min(g["lr"], lr_cap)
         if args.lr_schedule == "linear":
             frac = max(1.0 - it / max(args.iters, 1), 0.05)
             for g in optimizer.param_groups:
@@ -355,7 +383,8 @@ def main():
                 if ep_kl > 2.0 * args.desired_kl:
                     lr_now = max(lr_now / 1.5, args.lr_min)
                 elif ep_kl < 0.5 * args.desired_kl:
-                    lr_now = min(lr_now * 1.5, args.lr_max)
+                    lr_now = min(lr_now * 1.5, lr_cap)
+                lr_now = min(lr_now, lr_cap)
                 for g in optimizer.param_groups:
                     g["lr"] = lr_now
             # Standard PPO safety: stop this iteration's updates if the policy moved too far.
