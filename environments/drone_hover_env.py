@@ -617,6 +617,8 @@ class DroneHoverEnv(DirectRLEnv):
             tof_h = self._tof_s(tof_m / mx, dt)
             flow_h = self._flow_s(flow, dt)
             frame = torch.cat([imu, tof_h, prev_cmd, flow_h, self._target[:, 2:3]], dim=-1)
+            # For tools/flight_log.py (references only, no copies): what the policy saw.
+            self._dbg = {"frame": frame, "tof_meas": tof_m, "tof_true": tof_true, "flow_now": flow}
 
             self._hist = torch.cat([self._hist[:, 1:], frame[:, None]], dim=1)
             fill = self._hist_fill

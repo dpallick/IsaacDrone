@@ -99,6 +99,17 @@ mean success over the four tests), then fine-tunes it for 1500 iterations from i
 `--lr_max_final`) and tests the result. Compare everything with
 `python3 oscar/pick_best.py runs/${RUN}_s0 runs/${RUN}_s1 runs/${RUN}_ft_s*`.
 
+### Why and when does it fail? (flight recorder)
+```bash
+CKPT=runs/dd24_hover_1115_1834_s0/best.pt sbatch oscar/flight_recorder.sbatch
+#   SCENARIO=fixed_net or LAG=1 for the 3x3 net / worst-case lag
+```
+Flies 512 drones for one episode each (same setup as the tests), logs every step,
+then writes `<ckpt dir>/flights_<scenario>/`: `report.txt` (failure modes, when they
+happen, which conditions make failure or drift more likely), `plots/` (one
+flight-recorder dashboard per selected failure / worst drifter) and `videos/`
+(top + side animation of each, ToF beams as the policy saw them).
+
 ### Submit everything before you leave
 ```bash
 cd ~/IsaacDrone && git pull
