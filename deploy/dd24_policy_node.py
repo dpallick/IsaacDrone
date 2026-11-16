@@ -23,7 +23,7 @@ from mavros_msgs.msg import AttitudeTarget, OpticalFlowRad, State
 from sensor_msgs.msg import Imu, Range
 from std_msgs.msg import Float32MultiArray
 
-from dd24_policy_core import Core, FlowCfg, Policy, SafetyCfg
+from dd24_policy_core import Core, FlowCfg, Policy, SafetyCfg, roll_pitch_deg
 
 MODES = {"WAIT": 0.0, "RUN": 1.0, "NEUTRAL": 2.0, "STOP": 3.0}
 
@@ -56,6 +56,10 @@ class DD24PolicyNode(Node):
         sd = qos_profile_sensor_data
         self.create_subscription(Imu, P("imu_topic", "/mavros/imu/data").value, self.on_imu, sd)
         for name, drv in tof_driver.items():
+            if drv.lower() in ("", "none", "off"):
+                self.core.disabled.add(name)
+                self.get_logger().warn(f"ToF {name:5s} DISABLED -> always 'no target'")
+                continue
             topic = tof_topic.format(robot=robot, name=drv)
             self.create_subscription(Range, topic, lambda m, n=name: self.on_tof(n, m), sd)
             self.get_logger().info(f"ToF {name:5s} <- {topic}")
@@ -121,15 +125,17 @@ class DD24PolicyNode(Node):
 
     def log_status(self, r, flying):
         core = self.core
-        tofs = " ".join(f"{n[0].upper()}{(core.tof[n][1] if core.tof[n] else float('nan')):.2f}" for n in core.tof_names)
+        tofs = " ".join(f"{n[0].upper()}" + ("off" if n in core.disabled else
+                        f"{(core.tof[n][1] if core.tof[n] else float('nan')):.2f}") for n in core.tof_names)
         line = f"[{r.mode}{' DRY' if self.dry_run else ''}] {'OFFBOARD+armed' if flying else self.mode or '?'} | ToF {tofs}"
         if core.flow:
             line += f" | flow vx {core.flow[1]:+.2f} vy {core.flow[2]:+.2f} {'ok' if core.flow[3] else 'INVALID'}"
         if core.imu:
-            g = core.build_frame(self.now())[6:9]
-            line += f" | tilt {math.degrees(math.acos(max(-1, min(1, -g[2])))):4.1f} deg"
+            roll, pitch = roll_pitch_deg(core.build_frame(self.now())[6:9])
+            line += f" | roll {roll:+5.1f} pitch {pitch:+5.1f} deg"
         if r.thrust is not None:
-            line += f" | thrust {r.thrust:.3f} rates {np.round(r.rates, 2).tolist()}"
+            line += (f" | thrust {r.thrust:.3f} rates roll {r.rates[0]:+.2f} pitch {r.rates[1]:+.2f} "
+                     f"yaw {r.rates[2]:+.2f}")
         if r.reason:
             line += f" | {r.reason}"
         self.get_logger().info(line)
@@ -150,8 +156,11 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        node.destroy_node()
-        rclpy.try_shutdown()
+        try:                      # after Ctrl-C ROS may already be shut down: nothing to do
+            node.destroy_node()
+            rclpy.try_shutdown()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

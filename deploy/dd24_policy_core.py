@@ -62,6 +62,12 @@ def clean_tof(r: float, msg_max_range: float | None, tof_min: float, tof_max: fl
     return min(max(r, tof_min), tof_max)
 
 
+def roll_pitch_deg(g):
+    """Signed roll / pitch (deg, FLU) from the body gravity direction.
+    roll > 0: right side down; pitch > 0: nose down."""
+    return math.degrees(math.atan2(-g[1], -g[2])), math.degrees(math.atan2(g[0], -g[2]))
+
+
 def gravity_dir_body(q_xyzw) -> np.ndarray:
     """MAVROS orientation (ENU world -> FLU body, x y z w) -> gravity direction in body
     frame, R^T (0,0,-1); (0,0,-1) when level. Matches projected_gravity_b in the sim."""
@@ -149,6 +155,7 @@ class Core:
         self.tof = {n: None for n in self.tof_names}   # name -> (t, metres)
         self.flow = None                    # (t, vx, vy, valid)
         self.active = False
+        self.disabled = set()               # ToFs switched off (e.g. view blocked): always "no target"
 
     # ---- message inputs
     def on_imu(self, t, accel, gyro, quat_xyzw):
@@ -178,7 +185,7 @@ class Core:
         tofs = []
         for n in self.tof_names:
             v = self.tof[n]
-            stale = v is None or (n != "down" and t - v[0] > self.safety.tof_other_stale_s)
+            stale = v is None or n in self.disabled or (n != "down" and t - v[0] > self.safety.tof_other_stale_s)
             tofs.append((self.tof_max if stale else v[1]) / self.tof_max)
         if self.flow is None or t - self.flow[0] > self.safety.flow_invalid_s:
             flow = (0.0, 0.0, 0.0)
@@ -207,7 +214,7 @@ class Core:
             self.active = False
             return Tick("STOP", f"height {h:.2f} m > {s.max_height_m:.2f}", self.cmd.copy())
         for n in self.tof_names:
-            if n != "down" and (self.tof[n] is None or t - self.tof[n][0] > s.tof_other_stale_s):
+            if n != "down" and n not in self.disabled and (self.tof[n] is None or t - self.tof[n][0] > s.tof_other_stale_s):
                 warn.append(f"ToF {n} missing/stale -> no target")
         if not active:
             # Not flying the policy (not OFFBOARD+armed): keep PX4 fed with a calm setpoint

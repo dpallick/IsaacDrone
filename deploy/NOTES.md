@@ -23,6 +23,11 @@ current: every item is a place where the real drone differs from training.
   down-ToF height; `quality` 0 -> invalid. Sign convention assumed from MAVLink;
   **verify on the bench** (DEPLOY.md step 3.3) and record the result here.
 
+* **Top ToF reads ~0.07 m constantly** in the first dry run (drone held by hand):
+  likely the drone's own deck in view. If confirmed, re-aim/move it or run the node with
+  `-p tof_up:=none`. A blocked top ToF looks like a ceiling 7 cm away: the policy
+  commanded minimum thrust 4 cm above the target height.
+
 ## Hardware / setup
 
 * ToFs re-plugged to the Duckietown standard multiplexer channels: bottom CHL0

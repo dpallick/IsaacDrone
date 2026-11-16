@@ -50,10 +50,14 @@ Check, holding the drone by hand about 0.8 m above a textured floor:
    If a sign is wrong, add `-p flow_sign_x:=-1.0` and/or `-p flow_sign_y:=-1.0`
    (if forward shows up in `vy`: `-p flow_swap_xy:=true`). `INVALID` close to the floor
    (< 8 cm) or over a blank surface is expected.
-4. **Policy reacts the right way** (rates in the log are roll, pitch, yaw in rad/s, FLU):
-   tilt **right side down** -> roll rate goes **negative**; tilt **nose down** -> pitch rate
-   goes **negative** (it tries to level the drone). Held level and still at the target
-   height, thrust stays near 0.27 and rates stay small.
+4. **Policy reacts the right way.** The log shows signed `roll` (+ = right side down) and
+   `pitch` (+ = nose down) and the commanded rates. Tilt **right side down** (roll +10)
+   -> roll rate **negative**; **nose down** (pitch +10) -> pitch rate **negative** (it tries
+   to level). In dry run nothing is sent, so the drone never responds and commands can
+   saturate: judge the SIGN, not the size. Hold the drone by its legs, away from the
+   side/top ToFs (they will see your hands).
+   If the top ToF reads a few cm with nothing above (own structure in view), run with
+   `-p tof_up:=none` (always "no target", like the open-ceiling training scenes).
 5. **No `inputs far outside training` warnings** while held level near the target height.
    One means a unit / sign / axis is off: send us the line.
 6. Unplug a ToF or stop the flow container: the node keeps running (treats it as
