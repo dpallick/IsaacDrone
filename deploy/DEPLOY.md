@@ -54,7 +54,8 @@ Check, holding the drone by hand about 0.8 m above a textured floor:
    `pitch` (+ = nose down) and the commanded rates. Tilt **right side down** (roll +10)
    -> roll rate **negative**; **nose down** (pitch +10) -> pitch rate **negative** (it tries
    to level). In dry run nothing is sent, so the drone never responds and commands can
-   saturate: judge the SIGN, not the size. Hold the drone by its legs, away from the
+   saturate within 1-2 s: judge only the first moment after you change the tilt, use
+   small tilts (5-10 deg), and expect small built-in offsets (level: pitch rate ~ +0.2). Hold the drone by its legs, away from the
    side/top ToFs (they will see your hands).
    If the top ToF reads a few cm with nothing above (own structure in view), run with
    `-p tof_up:=none` (always "no target", like the open-ceiling training scenes).

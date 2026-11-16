@@ -28,6 +28,34 @@ current: every item is a place where the real drone differs from training.
   `-p tof_up:=none`. A blocked top ToF looks like a ceiling 7 cm away: the policy
   commanded minimum thrust 4 cm above the target height.
 
+## Dry-run results with the real policy (iter 713), checked offline with policy.npz
+
+* **Directions are right:** height below target -> more thrust, above -> less; at the
+  target the first command is ~0.243 (about hover). Small tilts (5-8 deg) -> rotation
+  rates back towards level, roll and pitch. Checked from a fresh history, as at the
+  OFFBOARD switch.
+* **Dry-run outputs saturate after ~1-2 s and are NOT meaningful then:** the drone is
+  held still, so commands never take effect (gyro stays 0, height never changes) and the
+  policy's own "previous command" input drifts to its limits. Large held tilts (>= 15 deg
+  with zero rotation) are rarer than anything in training and also give odd outputs.
+  Judge only the first moment after a change.
+* **Built-in offsets:** level and still it asks for pitch rate +0.18 rad/s and a little
+  yaw; training drones also spun slowly in yaw (gyro_z mean -0.22 rad/s). Expect a slow
+  yaw rotation and possibly a slight forward lean in flight.
+* **Thrust is used bang-bang in training** (previous-thrust input std 0.56 on a +-1
+  scale): watch for height "pumping" on the first flights.
+* My stand-in simulator (outside Isaac) could not reproduce Isaac's 94% with this policy
+  (vertical oscillation). Isaac remains the reference; the stand-in difference is still
+  unexplained, so the first real hovers must be short with the RC switch ready.
+
+## Training bugs found
+
+* **Accelerometer input is effectively unused.** Isaac's IMU accel had std 19-87 m/s^2
+  in the training statistics (spikes, most likely when episodes reset and the drone is
+  teleported), so the input normalisation scales real accelerations to ~0. Fix: exclude
+  the first steps after a reset from the IMU (or clamp accel to e.g. +-30 m/s^2) before
+  normalising, then retrain.
+
 ## Hardware / setup
 
 * ToFs re-plugged to the Duckietown standard multiplexer channels: bottom CHL0
