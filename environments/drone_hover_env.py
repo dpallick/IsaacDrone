@@ -164,6 +164,14 @@ class DroneHoverEnvCfg(DirectRLEnvCfg):
     tof_glitch_prob = 0.01                 # random "no target" on any ToF reading
     accel_noise_std = 0.05                 # m/s^2, white noise per reading
     accel_bias_range = 0.10                # m/s^2, constant offset per episode
+    # Isaac's IMU differentiates velocity, so the reset teleport shows up as an
+    # acceleration of hundreds of m/s^2. Those spikes inflated the input normalisation
+    # (accel std 19-87 m/s^2) and the policy learned to ignore its accelerometer.
+    # For the first steps of an episode report what an IMU at that attitude reads
+    # (gravity only), and clip every reading like a real IMU's range. The deployed node
+    # applies the same clip.
+    imu_settle_steps = 3                   # policy steps (60 ms)
+    accel_clip = 30.0                      # m/s^2, per axis
     gyro_noise_std = 0.01                  # rad/s
     gyro_bias_range = 0.01                 # rad/s (gyros drift; this is the slow part)
     gravity_dir_noise_std = 0.01           # attitude estimate (roll/pitch) error...
@@ -584,9 +592,13 @@ class DroneHoverEnv(DirectRLEnv):
         tof_m, tof_true = self._tof_readings(pos)
         mx = self.cfg.tof_max_range
 
+        # Accelerometer without reset spikes (see accel_clip / imu_settle_steps).
+        settle = (self.episode_length_buf < self.cfg.imu_settle_steps)[:, None]
+        lin_acc = torch.where(settle, -data.projected_gravity_b * 9.81, self.imu.data.lin_acc_b)
+
         if self.cfg.obs_mode == "privileged":
             policy = torch.cat([
-                self.imu.data.lin_acc_b,
+                lin_acc.clamp(-self.cfg.accel_clip, self.cfg.accel_clip),
                 self._target[:, 2:3] - pos[:, 2:3],
                 data.root_quat_w,
                 data.root_lin_vel_w,
@@ -596,8 +608,9 @@ class DroneHoverEnv(DirectRLEnv):
             ], dim=-1)
         else:
             # What the flight controller actually has, with realistic errors.
-            accel = self.imu.data.lin_acc_b + self._accel_bias \
-                + torch.randn_like(self._accel_bias) * self.cfg.accel_noise_std      # incl. gravity, like a real IMU
+            accel = (lin_acc + self._accel_bias
+                     + torch.randn_like(self._accel_bias) * self.cfg.accel_noise_std   # incl. gravity, like a real IMU
+                     ).clamp(-self.cfg.accel_clip, self.cfg.accel_clip)
             gyro = self.imu.data.ang_vel_b + self._gyro_bias \
                 + torch.randn_like(self._gyro_bias) * self.cfg.gyro_noise_std        # body axes
             # Roll/pitch from the attitude estimate as the direction of gravity in the

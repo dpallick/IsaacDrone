@@ -159,7 +159,11 @@ class Core:
 
     # ---- message inputs
     def on_imu(self, t, accel, gyro, quat_xyzw):
-        self.imu = (t, np.asarray(accel, float), np.asarray(gyro, float), tuple(quat_xyzw))
+        acc = np.asarray(accel, float)
+        clip = self.m.get("accel_clip")
+        if clip:                            # same clip as training (newer policies)
+            acc = np.clip(acc, -clip, clip)
+        self.imu = (t, acc, np.asarray(gyro, float), tuple(quat_xyzw))
 
     def on_tof(self, t, name, r, msg_max_range=None):
         self.tof[name] = (t, clean_tof(r, msg_max_range, self.tof_min, self.tof_max))

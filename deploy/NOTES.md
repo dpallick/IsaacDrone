@@ -52,9 +52,12 @@ current: every item is a place where the real drone differs from training.
 
 * **Accelerometer input is effectively unused.** Isaac's IMU accel had std 19-87 m/s^2
   in the training statistics (spikes, most likely when episodes reset and the drone is
-  teleported), so the input normalisation scales real accelerations to ~0. Fix: exclude
-  the first steps after a reset from the IMU (or clamp accel to e.g. +-30 m/s^2) before
-  normalising, then retrain.
+  teleported), so the input normalisation scales real accelerations to ~0.
+  FIXED (needs a retrain): the env reports gravity-only acceleration for the first 3
+  policy steps of each episode and clips every reading to +-30 m/s^2 (`imu_settle_steps`,
+  `accel_clip`); the node applies the same clip (stored in the policy file). The trainer
+  logs the accelerometer normalisation spread (`acc_std` in progress.csv, healthy: a
+  few m/s^2) and `oscar/check_smoke.py` refuses to launch a long run above 10.
 
 ## Hardware / setup
 

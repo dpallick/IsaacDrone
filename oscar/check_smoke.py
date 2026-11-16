@@ -36,8 +36,12 @@ else:
         problems.append(f"lr pinned at the maximum {LR_MAX:g} with tiny KL (policy not responding)")
     if max(kl) > 0.08:
         problems.append(f"KL spiked to {max(kl):.3f}")
+    acc = rows[-1].get("acc_std") or ""
+    if acc and float(acc) > 10.0:
+        problems.append(f"accelerometer normalisation spread {float(acc):.1f} m/s^2 (> 10): reset spikes are "
+                        "still getting into the IMU input")
     print(f"second half of smoke run: lr {min(lr):.1e}..{max(lr):.1e}, kl {min(kl):.4f}..{max(kl):.4f}, "
-          f"reward {rew[0]:.3f} -> {rew[-1]:.3f}")
+          f"reward {rew[0]:.3f} -> {rew[-1]:.3f}, accelerometer spread {rows[-1].get('acc_std') or 'n/a'} m/s^2")
 
 if problems:
     print("STOP - not launching the long run:")

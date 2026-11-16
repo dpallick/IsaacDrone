@@ -118,6 +118,11 @@ def main():
     critic = Critic(obs_dim=critic_dim).to(device)
     # Running input normalisation (saved in the checkpoint, frozen at deployment).
     actor_norm = RunningNorm(obs_dim).to(device)
+    # Accelerometer inputs (first 3 of each 22-number frame): their normalisation spread
+    # is logged, a healthy value is a few m/s^2 (reset spikes once pushed it to 19-87).
+    acc_idx = ([k * 22 + j for k in range(env_cfg.obs_history) for j in range(3)]
+               if args.obs_mode == "onboard" and obs_dim == 22 * env_cfg.obs_history else [])
+    acc_std = lambda: actor_norm.var[acc_idx].sqrt().mean().item()  # noqa: E731
     critic_norm = RunningNorm(critic_dim).to(device)
 
     log_std = nn.Parameter(torch.ones(4, device=device) * args.init_log_std)
@@ -157,6 +162,7 @@ def main():
             "scenario": args.scenario,
             "control_mode": args.control_mode,
             "ctbr_thrust_center": env_cfg.ctbr_thrust_center,
+            "accel_clip": getattr(env_cfg, "accel_clip", None),
             "ctbr_thrust_span": env_cfg.ctbr_thrust_span,
             "ctbr_max_rates": list(env_cfg.ctbr_max_rates),
             "policy_hz": 1.0 / (env_cfg.sim.dt * env_cfg.decimation),
@@ -212,7 +218,7 @@ def main():
     writer = csv.writer(csv_file)
     if new_csv:
         writer.writerow(["iter", "reward", "ep_len", "log_std", "crash_frac", "net_frac", "minutes",
-                         "lr", "kl"])
+                         "lr", "kl", "acc_std"])
 
     obs, _ = env.reset()
     it = start_it - 1
@@ -413,7 +419,8 @@ def main():
         )
         writer.writerow([it, f"{mean_reward:.5f}", f"{avg_ep_len:.1f}",
                          f"{log_std.mean().item():.4f}", f"{crash_frac:.4f}",
-                         f"{net_frac:.4f}", f"{minutes:.2f}", f"{lr_now:.3e}", f"{mean_kl:.5f}"])
+                         f"{net_frac:.4f}", f"{minutes:.2f}", f"{lr_now:.3e}", f"{mean_kl:.5f}",
+                         f"{acc_std():.3f}" if acc_idx else ""])
         csv_file.flush()
 
         if mean_reward > best_reward:

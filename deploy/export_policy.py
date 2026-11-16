@@ -48,6 +48,7 @@ def main(ckpt, out):
         "flow_max_rate": 2.0,
         "norm_min_std": 0.01,
         "norm_clip": 10.0,
+        "accel_clip": ck.get("accel_clip"),     # None for policies trained before the IMU fix
     }
     if meta["obs_dim"] != 22 * meta["obs_history"]:
         raise SystemExit(f"obs_dim {meta['obs_dim']} != 22 x {meta['obs_history']}: unexpected input layout")
