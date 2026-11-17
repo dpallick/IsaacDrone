@@ -9,6 +9,7 @@ Files (this folder):
 | `export_policy.py` | checkpoint (`best.pt`) -> `policy.npz` (no PyTorch needed on the Pi) |
 | `run_on_drone.sh` | copies the node into the `ros2-mavros` container and starts it |
 | `INTERFACE.md` | exact input / output definition |
+| `sim_sensor_bridge.py`, `VIRTUAL_DRONE_HANDOFF.md` | virtual Duckiedrone (Duckiematrix) testing: stand-in ToF/flow sensors and the full test plan |
 | `NOTES.md` | sensor quirks found on the real drone and what to fix next |
 
 ## 1. Export the policy (Oscar) and copy it over
